@@ -1,0 +1,153 @@
+cmake_minimum_required(VERSION 3.18)
+project(
+    intel-accel-for-llm
+    VERSION 0.10.0
+    LANGUAGES C CXX)
+
+set(DEVICE
+    "cuda"
+    CACHE STRING "Accelerator backend: cuda or xpu")
+set_property(CACHE DEVICE PROPERTY STRINGS cuda xpu)
+if(NOT DEVICE STREQUAL "cuda" AND NOT DEVICE STREQUAL "xpu")
+    message(FATAL_ERROR "Unsupported DEVICE=${DEVICE}; expected cuda or xpu")
+endif()
+
+option(BUILD_CPU_BIND_SUPPORT "Enable CPU binding support" OFF)
+option(BUILD_AVX512_SUPPORT "Enable AVX512 support" OFF)
+option(ENABLE_TORCH_PROFILER "Enable Torch profiler integration" ON)
+if(DEVICE STREQUAL "cuda")
+    option(ENABLE_NVTX "Enable NVTX profiling integration" ON)
+else()
+    option(ENABLE_NVTX "Enable NVTX profiling integration" OFF)
+endif()
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(NOT DEFINED CXX11_ABI)
+    message(FATAL_ERROR "CXX11_ABI must be provided by setup.py")
+endif()
+
+find_package(
+    Python
+    COMPONENTS Interpreter Development
+    REQUIRED)
+find_package(pybind11 REQUIRED)
+
+execute_process(
+    COMMAND ${Python_EXECUTABLE} -c
+            "import pathlib, torch; print(pathlib.Path(torch.__file__).resolve().parent)"
+    OUTPUT_VARIABLE PYTORCH_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE PYTORCH_RESULT)
+if(NOT PYTORCH_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to locate the active PyTorch installation")
+endif()
+
+set(IAXL_CSRC_DIR "${CMAKE_SOURCE_DIR}/iaxl/csrc")
+set(IAXL_LIB_DIR
+    "${CMAKE_SOURCE_DIR}/_lib"
+    CACHE PATH "QAT library directory")
+
+execute_process(
+    COMMAND git rev-parse HEAD
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE IAXL_COMMIT_ID
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+
+file(GLOB TORCH_EXT_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/torch_ext/*.cpp")
+file(GLOB KV_POOL_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/kv_pool/*.cpp")
+file(GLOB KV_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/kv_zip/*.cpp")
+file(GLOB QAT_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/qat_zip/*.c")
+file(GLOB COMMON_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/common/*.c")
+set(IAXL_SRCS ${TORCH_EXT_SRCS} ${KV_POOL_SRCS} ${KV_ZIP_SRCS} ${QAT_ZIP_SRCS} ${COMMON_SRCS})
+
+if(DEVICE STREQUAL "cuda")
+    list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/cuda.cpp" "${IAXL_CSRC_DIR}/kv_xfer/dsa.cpp")
+    file(GLOB DSA_GD_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/dsa_gd/*.c")
+    list(APPEND IAXL_SRCS ${DSA_GD_SRCS})
+    set_source_files_properties(${DSA_GD_SRCS} PROPERTIES COMPILE_OPTIONS
+                                                          "-std=gnu11;-D_GNU_SOURCE")
+else()
+    list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/xpu.cpp")
+endif()
+
+set(QAT_USERSPACE_LIBS "${IAXL_LIB_DIR}/libqat_s.so" "${IAXL_LIB_DIR}/libusdm_drv_s.so")
+add_custom_command(
+    OUTPUT ${QAT_USERSPACE_LIBS}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${IAXL_LIB_DIR}"
+    COMMAND make -C "${IAXL_CSRC_DIR}" DEVICE=${DEVICE} qat-userspace
+    COMMENT "Building Intel QAT user-space libraries"
+    VERBATIM)
+add_custom_target(qat_userspace_libs DEPENDS ${QAT_USERSPACE_LIBS})
+
+pybind11_add_module(torch_ext ${IAXL_SRCS})
+add_dependencies(torch_ext qat_userspace_libs)
+
+target_compile_definitions(
+    torch_ext
+    PRIVATE TORCH_EXTENSION_NAME=torch_ext _GLIBCXX_USE_CXX11_ABI=${CXX11_ABI}
+            IAXL_PROJECT_NAME="${PROJECT_NAME}" IAXL_PROJECT_VERSION="${PROJECT_VERSION}"
+            IAXL_COMMIT_ID="${IAXL_COMMIT_ID}" IAXL_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
+target_compile_options(
+    torch_ext PRIVATE -O3 -fopenmp $<$<BOOL:${BUILD_AVX512_SUPPORT}>:-mavx2;-mavx512f;-mavx512bw>)
+target_link_options(torch_ext PRIVATE -fopenmp)
+target_include_directories(
+    torch_ext
+    PRIVATE "${PYTORCH_PATH}/include" "${PYTORCH_PATH}/include/torch/csrc/api/include"
+            "${IAXL_CSRC_DIR}/include" "${IAXL_CSRC_DIR}/torch_ext"
+            "${IAXL_CSRC_DIR}/qat_zip/include")
+target_link_directories(torch_ext PRIVATE "${PYTORCH_PATH}/lib" "${IAXL_LIB_DIR}")
+target_link_libraries(torch_ext PRIVATE torch torch_python qat_s usdm_drv_s)
+
+if(DEVICE STREQUAL "cuda")
+    find_package(CUDAToolkit REQUIRED)
+    target_compile_definitions(torch_ext PRIVATE CUDA_SUPPORT=1 DSA_SUPPORT=1)
+    target_include_directories(torch_ext PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(torch_ext PRIVATE ${CUDAToolkit_LIBRARIES} gdrapi dl)
+
+    if(ENABLE_NVTX)
+        file(GLOB _nvtx_pip_hints "/usr/local/lib/python*/dist-packages/nvidia/*/include"
+             "/usr/lib/python*/dist-packages/nvidia/*/include")
+        find_path(NVTX_INCLUDE_DIR "nvtx3/nvToolsExt.h"
+                  HINTS ${CUDAToolkit_INCLUDE_DIRS} $ENV{NVTX_INCLUDE_DIR} ${_nvtx_pip_hints})
+        if(NVTX_INCLUDE_DIR)
+            target_compile_definitions(torch_ext PRIVATE ENABLE_NVTX=1)
+            target_include_directories(torch_ext PRIVATE "${NVTX_INCLUDE_DIR}")
+            message(STATUS "NVTX enabled from ${NVTX_INCLUDE_DIR}")
+        else()
+            message(WARNING "nvtx3/nvToolsExt.h not found; NVTX disabled")
+        endif()
+    endif()
+else()
+    target_compile_definitions(torch_ext PRIVATE XPU_SUPPORT=1)
+endif()
+
+if(ENABLE_TORCH_PROFILER)
+    target_compile_definitions(torch_ext PRIVATE ENABLE_TORCH_PROFILER=1)
+endif()
+
+if(BUILD_CPU_BIND_SUPPORT)
+    target_compile_definitions(torch_ext PRIVATE CPU_BIND_SUPPORT=1)
+    target_link_libraries(torch_ext PRIVATE numa)
+endif()
+
+find_package(SQLite3 QUIET)
+if(TARGET SQLite3::SQLite3)
+    target_link_libraries(torch_ext PRIVATE SQLite3::SQLite3)
+elseif(TARGET SQLite::SQLite3)
+    target_link_libraries(torch_ext PRIVATE SQLite::SQLite3)
+else()
+    target_link_libraries(torch_ext PRIVATE sqlite3)
+endif()
+
+set_target_properties(
+    torch_ext
+    PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/iaxl"
+               BUILD_RPATH "${IAXL_LIB_DIR}"
+               INSTALL_RPATH "${IAXL_LIB_DIR}:$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib")
