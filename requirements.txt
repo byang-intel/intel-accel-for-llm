@@ -1,0 +1,5 @@
+setuptools>=45
+wheel
+cmake
+pybind11
+intel-openmp

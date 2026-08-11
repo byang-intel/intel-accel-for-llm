@@ -1,0 +1,9 @@
+
+ARG BASE="ubuntu:20.04"
+FROM $BASE
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update -y \
+    && apt-get install -y vim git iproute2 wget curl pkg-config libboost-all-dev libudev-dev nasm yasm liblz4-dev libsqlite3-dev \
+        $(apt-cache search "linux-headers-5.15.*-generic" | tail -n 1 | awk '{print $1}')

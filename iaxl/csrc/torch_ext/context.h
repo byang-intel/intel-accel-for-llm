@@ -1,0 +1,203 @@
+// Copyright (C) 2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <torch/extension.h>
+#include <vector>
+#include <cstdint>
+#include <future>
+#include <atomic>
+#include <queue>
+#include <mutex>
+#include <omp.h>
+
+#include "task_queue.h"
+#include "profiler.h"
+#include "env.h"
+#include "iaxl_common.h"
+
+using namespace profiler;
+
+#include "kv_xfer.h"
+
+namespace kv_pool {
+class Mem;
+}
+
+enum class GpuTransferDirection { H2D, D2H };
+
+inline TaskQueue &h2d_queue();
+inline TaskQueue &d2h_queue();
+inline TaskQueue &omp_queue();
+
+class Context {
+  public:
+    static Context create(const torch::Tensor &tensor, int chunk_dim,
+                          GpuTransferDirection direction = GpuTransferDirection::H2D,
+                          const std::string &name = "", kv_xfer::stream_t work_stream = nullptr) {
+        Context ctx;
+        ctx.name_ = name;
+        ctx.gpu_tensor_ = tensor;
+        ctx.direction_ = direction;
+        ctx.event_ = kv_xfer::event_acquire();
+        ctx.queue_ = &((direction == GpuTransferDirection::H2D) ? h2d_queue() : d2h_queue());
+
+        int64_t outer_dims = 1;
+        for (int d = 0; d < chunk_dim; d++)
+            outer_dims *= tensor.size(d);
+        int64_t inner_size = tensor.element_size();
+        for (int d = chunk_dim + 1; d < tensor.dim(); d++)
+            inner_size *= tensor.size(d);
+        int64_t chunk_stride = tensor.stride(chunk_dim) * tensor.element_size();
+        int64_t outer_block_size = tensor.size(chunk_dim) * inner_size;
+
+        ctx.xctx_ = kv_xfer::context_create((char *)tensor.data_ptr(), tensor.device().index(),
+                                            chunk_stride, outer_dims, inner_size, outer_block_size,
+                                            work_stream);
+        ctx.stream_id_ = kv_xfer::context_stream_id(ctx.xctx_);
+
+        PROFILE_SCOPE_FMT("ctx_create(%s,stream=%llu)", name.c_str(), ctx.stream_id_);
+        return ctx;
+    }
+
+    void xfer_chunk(const torch::Tensor &cpu_tensor, int64_t chunk_idx);
+    void xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
+                           const std::vector<torch::Tensor> &cpu_tensors);
+    void xfer_finish();
+    void xfer_wait();
+    bool xfer_is_complete();
+
+    void xfer_wait_cur_stream(bool sync_cur_stream = false);
+    void xfer_wait_stream(kv_xfer::event_t wait_event);
+    bool xfer_wait_stream(pybind11::object cur_stream);
+
+    void zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
+                    const std::vector<std::string> &chunk_labels,
+                    const std::vector<torch::Tensor> &cpu_tensors);
+
+    void unzip_from_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
+                        const std::vector<std::string> &chunk_labels,
+                        const std::vector<int64_t> &chunk_indices,
+                        const std::vector<torch::Tensor> &cpu_tensors);
+
+    void zip_wait();
+    bool zip_is_complete();
+    void unzip_wait();
+    bool unzip_is_complete();
+
+    void reset_async_state() { event_recorded_.store(false, std::memory_order_release); }
+
+    unsigned long long stream_id() const { return stream_id_; }
+    kv_xfer::event_t event() const { return event_; }
+    TaskQueue &queue() const { return *queue_; }
+    const std::string &name() const { return name_; }
+
+    Context() = default;
+    ~Context() {
+        check_no_pending_work();
+        kv_xfer::event_release(event_);
+        kv_xfer::context_destroy(xctx_);
+    }
+    Context(Context &&other) noexcept { *this = std::move(other); }
+    Context &operator=(Context &&other) noexcept {
+        if (this != &other) {
+            check_no_pending_work();
+            kv_xfer::event_release(event_);
+            kv_xfer::context_destroy(xctx_);
+
+            xctx_ = other.xctx_;
+            stream_id_ = other.stream_id_;
+            gpu_tensor_ = std::move(other.gpu_tensor_);
+            direction_ = other.direction_;
+            queue_ = other.queue_;
+            event_ = other.event_;
+            xfer_last_future_ = std::move(other.xfer_last_future_);
+            event_recorded_.store(other.event_recorded_.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+            name_ = std::move(other.name_);
+            zip_future_ = std::move(other.zip_future_);
+            unzip_future_ = std::move(other.unzip_future_);
+
+            other.xctx_ = nullptr;
+            other.event_ = nullptr;
+            other.event_recorded_.store(false, std::memory_order_relaxed);
+        }
+        return *this;
+    }
+    Context(const Context &) = delete;
+    Context &operator=(const Context &) = delete;
+
+  private:
+    void check_no_pending_work() const {
+        IAXL_CHECK(!xfer_last_future_.valid(), "Context destroyed before xfer_wait completed");
+        IAXL_CHECK(!zip_future_.valid(), "Context destroyed before zip_wait completed");
+        IAXL_CHECK(!unzip_future_.valid(), "Context destroyed before unzip_wait completed");
+    }
+
+    kv_xfer::context_t xctx_ = nullptr;
+    unsigned long long stream_id_ = 0;
+    torch::Tensor gpu_tensor_;
+    GpuTransferDirection direction_ = GpuTransferDirection::H2D;
+    TaskQueue *queue_ = nullptr;
+    kv_xfer::event_t event_ = nullptr;
+    std::future<void> xfer_last_future_;
+    std::atomic<bool> event_recorded_{false};
+    std::string name_;
+    std::future<void> zip_future_;
+    std::future<void> unzip_future_;
+};
+
+inline void gpu_transfer_batch_pytorch(torch::Tensor &gpu_tensor, int chunk_dim,
+                                       const std::vector<int64_t> &chunk_indices,
+                                       const std::vector<torch::Tensor> &cpu_tensors,
+                                       GpuTransferDirection direction) {
+    for (size_t i = 0; i < chunk_indices.size(); i++) {
+        auto gpu_slice = gpu_tensor.select(chunk_dim, chunk_indices[i]);
+        if (direction == GpuTransferDirection::H2D) {
+            gpu_slice.copy_(cpu_tensors[i], true);
+        } else {
+            cpu_tensors[i].copy_(gpu_slice, true);
+        }
+    }
+}
+
+inline TaskQueue &h2d_queue() {
+    static TaskQueue queue("H2D");
+    static const bool initialized = []() {
+        queue.init();
+        return true;
+    }();
+    (void)initialized;
+    return queue;
+}
+
+inline TaskQueue &d2h_queue() {
+    static TaskQueue queue("D2H");
+    static const bool initialized = []() {
+        queue.init();
+        return true;
+    }();
+    (void)initialized;
+    return queue;
+}
+
+inline TaskQueue &omp_queue() {
+    static TaskQueue queue("OMP-Main");
+    static const bool initialized = []() {
+        int qat_threads = envs.IAXL_QAT_INSTANCE_NUM;
+
+#pragma omp parallel num_threads(qat_threads)
+        {
+            int tid = omp_get_thread_num();
+            std::string name = "OMP-" + std::to_string(tid);
+            profiler::set_thread_name(name.c_str());
+        }
+
+        queue.init();
+        return true;
+    }();
+    (void)initialized;
+
+    return queue;
+}

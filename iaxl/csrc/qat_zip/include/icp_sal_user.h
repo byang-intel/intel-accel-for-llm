@@ -1,0 +1,881 @@
+/***************************************************************************
+ *
+ *   SPDX-License-Identifier: BSD-3-Clause
+ *   Copyright(c) 2007-2026 Intel Corporation
+ * 
+ *   These contents may have been developed with support from one or more
+ *   Intel-operated generative artificial intelligence solutions.
+ *
+ ***************************************************************************/
+
+/**
+ ***************************************************************************
+ * @file icp_sal_user.h
+ *
+ * @ingroup SalUser
+ *
+ * User space process init and shutdown functions.
+ *
+ ***************************************************************************/
+
+#ifndef ICP_SAL_USER_H
+#define ICP_SAL_USER_H
+
+#include "icp_sal.h"
+#include "cpa_dc.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function initialises and starts user space service access layer
+ *    (SAL) - it registers SAL with ADF and initialises the ADF proxy.
+ *    This function must only be called once per user space process.
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in] pProcessName           Process address space name described in
+ *                                   the config file for this device
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ *
+ *************************************************************************/
+CpaStatus icp_sal_userStart(const char *pProcessName);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    Simple wrapper for the icp_sal_userStart() function
+ *
+ *    This function is only for backwards compatibility.
+ *    New users should use icp_sal_userStart function directly.
+ *
+ *************************************************************************/
+CpaStatus icp_sal_userStartMultiProcess(const char *pProcessName,
+                                        CpaBoolean limitDevAccess);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function stops and shuts down user space SAL
+ *     - it deregisters SAL with ADF and shuts down ADF proxy
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userStop(void);
+#ifndef ICP_DC_ONLY
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function gets the number of the available dynamic allocated
+ *    crypto instances.
+ *
+ * @context
+ *      This function is called from the user process context.
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+
+CpaStatus icp_sal_userCyGetAvailableNumDynInstances(Cpa32U *pNumCyInstances);
+#endif
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function gets the number of the available dynamic allocated
+ *    compression instances
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+
+CpaStatus icp_sal_userDcGetAvailableNumDynInstances(Cpa32U *pNumDcInstances);
+
+#ifndef ICP_DC_ONLY
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function gets the number of the available dynamic allocated
+ *    crypto instances which are from the specific device package.
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userCyGetAvailableNumDynInstancesByDevPkg(
+    Cpa32U *pNumCyInstances,
+    Cpa32U devPkgID);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function gets the number of the available dynamic allocated
+ *    crypto instances which are from the specific device package and specific
+ *    accelerator.
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userCyGetAvailableNumDynInstancesByPkgAccel(
+    Cpa32U *pNumCyInstances,
+    Cpa32U devPkgID,
+    Cpa32U accelerator_number);
+#endif
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function gets the number of the available dynamic allocated
+ *    compression instances which are from the specific device package.
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userDcGetAvailableNumDynInstancesByDevPkg(
+    Cpa32U *pNumDcInstances,
+    Cpa32U devPkgID);
+
+#ifndef ICP_DC_ONLY
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function allocates crypto instances
+ *    from dynamic crypto instance pool
+ *     - it adds new allocated instances into crypto_services
+ *     - it initializes new allocated instances
+ *     - it starts new allocated instances
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userCyInstancesAlloc(Cpa32U numCyInstances,
+                                       CpaInstanceHandle *pCyInstances);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function allocates crypto instances
+ *    from dynamic crypto instance pool
+ *    which are from the specific device package.
+ *     - it adds new allocated instances into crypto_services
+ *     - it initializes new allocated instances
+ *     - it starts new allocated instances
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userCyInstancesAllocByDevPkg(Cpa32U numCyInstances,
+                                               CpaInstanceHandle *pCyInstances,
+                                               Cpa32U devPkgID);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function allocates crypto instances
+ *    from dynamic crypto instance pool
+ *    which are from the specific device package and specific accelerator
+ *     - it adds new allocated instances into crypto_services
+ *     - it initializes new allocated instances
+ *     - it starts new allocated instances
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userCyInstancesAllocByPkgAccel(
+    Cpa32U numCyInstances,
+    CpaInstanceHandle *pCyInstances,
+    Cpa32U devPkgID,
+    Cpa32U accelerator_number);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function frees crypto instances allocated
+ *    from dynamic crypto instance pool
+ *     - it stops the instances
+ *     - it shutdowns the instances
+ *     - it removes the instances from crypto_services
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userCyFreeInstances(Cpa32U numCyInstances,
+                                      CpaInstanceHandle *pCyInstances);
+#endif
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function allocates compression instances
+ *    from dynamic compression instance pool
+ *     - it adds new allocated instances into compression_services
+ *     - it initializes new allocated instances
+ *     - it starts new allocated instances
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userDcInstancesAlloc(Cpa32U numDcInstances,
+                                       CpaInstanceHandle *pDcInstances);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function allocates compression instances
+ *    from dynamic compression instance pool
+ *    which are from the specific device package.
+ *     - it adds new allocated instances into compression_services
+ *     - it initializes new allocated instances
+ *     - it starts new allocated instances
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userDcInstancesAllocByDevPkg(Cpa32U numDcInstances,
+                                               CpaInstanceHandle *pDcInstances,
+                                               Cpa32U devPkgID);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function frees compression instances allocated
+ *    from dynamic compression instance pool
+ *     - it stops the instances
+ *     - it shutdowns the instances
+ *     - it removes the instances from compression_services
+ *
+ * @context
+ *      This function is called from the user process context
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_userDcFreeInstances(Cpa32U numDcInstances,
+                                      CpaInstanceHandle *pDcInstances);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function checks if new devices have been started and if so
+ *    starts to use them.
+ *
+ * @context
+ *      This function is called from the user process context
+ *      in threadless mode
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      No
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Deprecated function
+ *
+ ************************************************************************/
+CpaStatus icp_sal_find_new_devices(void);
+
+/*************************************************************************
+ * @ingroup SalUser
+ * @description
+ *    This function polls device events.
+ *
+ * @context
+ *      This function is called from the user process context
+ *      in threadless mode
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      In case a device has been stopped or restarted the application
+ *      will get restarting/stop/shutdown events
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      No
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ *
+ ************************************************************************/
+CpaStatus icp_sal_poll_device_events(void);
+
+/*
+ * icp_sal_check_device
+ *
+ * @description:
+ *    This function checks the status of the device and also if it supports
+ *    heartbeat or not.
+ *    This function is used as part of the heartbeat functionality.
+ *
+ * @context
+ *      This function is called from the user process context
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      In case a device is unresponsive the device will
+ *      be restarted.
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in] packageId              The package Id can be found by calling
+ *                                   cpaCyInstanceGetInfo2() or
+ *                                   cpaDcInstanceGetInfo2().
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Unsupported feature
+ */
+CpaStatus icp_sal_check_device(Cpa32U packageId);
+
+/*
+ * icp_sal_check_all_devices
+ *
+ * @description:
+ *    This function checks the status of the device and also if it supports
+ *    heartbeat or not.
+ *    This function is used as part of the heartbeat functionality.
+ *
+ * @context
+ *      This function is called from the user process context
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      In case a device is unresponsive the device will
+ *      be restarted.
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ * @retval CPA_STATUS_UNSUPPORTED    Unsupported feature
+ */
+CpaStatus icp_sal_check_all_devices(void);
+
+/*
+ * icp_sal_heartbeat_simulate_failure
+ *
+ * @description:
+ *  This function simulates a heartbeat failure
+ *
+ * @context
+ *      This function is called from the user process context
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      This along with a icp_sal_check call will notify the heartbeat
+ *      error to user space
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[in] packageId              The package Id can be found by calling
+ *                                   cpaCyInstanceGetInfo2() or
+ *                                   cpaDcInstanceGetInfo2().
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ */
+CpaStatus icp_sal_heartbeat_simulate_failure(Cpa32U packageId);
+
+#define CPA_DEVICE_GEN_LEN 16
+typedef struct
+{
+    Cpa32U pkg_id;
+    Cpa16U domain;
+    Cpa16U bdf;
+    char device_gen[CPA_DEVICE_GEN_LEN + 1];
+} CpaPfInfo;
+
+/*
+ * icp_sal_get_num_pfs
+ *
+ * @description:
+ *  Returns the number of PFs in the system, only returned if the process has
+ *  privileges to access the QAT debugfs/sysfs entries.
+ *
+ * @context
+ *      This function is called from the user process context
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[out] pNumPFs               The number of PFs in the system.
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ */
+CpaStatus icp_sal_get_num_pfs(Cpa16U *pNumPFs);
+
+/*
+ * icp_sal_get_pf_info
+ *
+ * @description:
+ *  This function populates a pre-allocated list of PF info, only returned
+ *  if the process has privileges to access the QAT debugfs/sysfs entries.
+ *
+ * @context
+ *      This function is called from the user process context
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      Yes
+ *
+ * @param[out] pPfInfo               Pre-allocated list of PF info, the size of
+ *                                   this should match the number of PFs on
+ *                                   the platform.
+ * @retval CPA_STATUS_SUCCESS        No error
+ * @retval CPA_STATUS_FAIL           Operation failed
+ */
+CpaStatus icp_sal_get_pf_info(CpaPfInfo *pPf_info);
+
+/*
+ * @ingroup icp_sal_user
+ * @description
+ *      This is a stub function to send messages to VF
+ *
+ * @context
+ *      None
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      Yes
+ * @threadSafe
+ *      Yes
+ *
+ */
+CpaStatus icp_sal_userSendMsgToVf(Cpa32U accelId, Cpa32U vfNum, Cpa32U message);
+
+/*
+ * @ingroup icp_sal_user
+ * @description
+ *      This is a stub function to send messages to PF
+ *
+ * @context
+ *      None
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      Yes
+ * @threadSafe
+ *      Yes
+ *
+ */
+CpaStatus icp_sal_userSendMsgToPf(Cpa32U accelId, Cpa32U message);
+
+/*
+ * @ingroup icp_sal_user
+ * @description
+ *      This is a stub function to get messages from VF
+ *
+ * @context
+ *      None
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      Yes
+ * @threadSafe
+ *      Yes
+ *
+ */
+CpaStatus icp_sal_userGetMsgFromVf(Cpa32U accelId,
+                                   Cpa32U vfNum,
+                                   Cpa32U *message,
+                                   Cpa32U *messageCounter);
+
+/*
+ * @ingroup icp_sal_user
+ * @description
+ *      This is a stub function to get messages from PF
+ *
+ * @context
+ *      None
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      Yes
+ * @threadSafe
+ *      Yes
+ *
+ */
+CpaStatus icp_sal_userGetMsgFromPf(Cpa32U accelId,
+                                   Cpa32U *message,
+                                   Cpa32U *messageCounter);
+
+/*
+ * @ingroup icp_sal_user
+ * @description
+ *      This is a stub function to get pfvf comms status
+ *
+ * @context
+ *      None
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      Yes
+ * @threadSafe
+ *      Yes
+ *
+ */
+CpaStatus icp_sal_userGetPfVfcommsStatus(CpaBoolean *unreadMessage);
+
+/*
+ * @ingroup icp_sal_user
+ * @description
+ *      This is a stub function to reset the device
+ *
+ * @context
+ *     None
+ *
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      Yes
+ * @threadSafe
+ *      Yes
+ *
+ */
+CpaStatus icp_sal_reset_device(Cpa32U accelId);
+
+/*
+ * icp_sal_userIsQatAvailable
+ *
+ * @description:
+ *  This function returns CPA_TRUE if a QAT device is present in the
+ *  system and available to qatlib
+ *
+ * @context
+ *      This function is called from the user process context
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      No
+ *
+ * @retval CPA_TRUE     QAT device available
+ * @retval CPA_FALSE    QAT device not available
+ *
+ */
+CpaBoolean icp_sal_userIsQatAvailable(void);
+
+/*
+ * icp_sal_cnv_simulate_error
+ *
+ * @description:
+ *  This function enables the CnVError injection for the
+ *  session passed in. All Compression requests sent within
+ *  the session are injected with CnV errors. This error injection
+ *  is for the duration of the session. Resetting the session
+ *  results in setting being cleared.
+ *  CnV error injection does not apply to Data Plane API.
+ *
+ * @note Only applies when compressAndVerify is on and
+ *  compressAndVerifyAndRecover is off.
+ *
+ * @context
+ *      This function is called from the user process context
+ * @assumptions
+ *      The session has been initialized via cpaDcInitSession function
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      No
+ *
+ * @param[in] dcInstance             Instance Handle
+ * @param[in] pSessionHandle         Session Handle
+ *
+ * @retval CPA_STATUS_UNSUPPORTED    Unsupported feature
+ * @retval CPA_STATUS_INVALID_PARAM  Invalid parameter passed in
+ * @retval CPA_STATUS_SUCCESS        No error
+ *
+ */
+CpaStatus icp_sal_cnv_simulate_error(CpaInstanceHandle dcInstance,
+                                     CpaDcSessionHandle pSessionHandle);
+
+/*
+ * icp_sal_ns_cnv_simulate_error
+ *
+ * @description:
+ *  This function enables the CnVError injection for the
+ *  No-Session case. All Compression requests sent
+ *  to the dcInstance that is  passed in as a parameter,
+ *  are injected with CnV errors. This CnV error injection
+ *  does not apply to Data Plane API.
+ *  This function is for GEN4 devices.
+ * @context
+ *      This function is called from the user process context
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      No
+ *
+ * @param[in] dcInstance             Instance Handle
+ *
+ * @retval CPA_STATUS_UNSUPPORTED    Unsupported feature
+ * @retval CPA_STATUS_INVALID_PARAM  Invalid parameter passed in
+ * @retval CPA_STATUS_SUCCESS        No error
+ *
+ */
+CpaStatus icp_sal_ns_cnv_simulate_error(CpaInstanceHandle dcInstance);
+
+/*
+ * icp_sal_ns_cnv_reset_error
+ *
+ * @description:
+ *  This function resets the CnVError injection for the
+ *  specific dcInstance that is passed in as a parameter
+ *  for the No-Session operations.
+ * @context
+ *      This function is called from the user process context
+ * @assumptions
+ *      None
+ * @sideEffects
+ *      None
+ * @reentrant
+ *      No
+ * @threadSafe
+ *      No
+ *
+ * @param[in] dcInstance             Instance Handle
+ *
+ * @retval CPA_STATUS_UNSUPPORTED    Unsupported feature
+ * @retval CPA_STATUS_INVALID_PARAM  Invalid parameter passed in
+ * @retval CPA_STATUS_SUCCESS        No error
+ *
+ */
+CpaStatus icp_sal_ns_cnv_reset_error(CpaInstanceHandle dcInstance);
+
+#ifdef __cplusplus
+} /* close the extern "C" { */
+#endif
+
+#endif
