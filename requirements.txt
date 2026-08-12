@@ -3,3 +3,4 @@ wheel
 cmake
 pybind11
 intel-openmp
+xxhash

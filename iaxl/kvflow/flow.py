@@ -218,17 +218,21 @@ class KVFlow:
             tensor_dict_keys if tensor_dict_keys else list(put_results.keys())
         )
 
+        if not wait:
+            for key in keys_to_wait:
+                assert key in put_results, f"Key {key} not in put_results"
+                result = put_results[key]
+                assert result.ctx is not None, f"Task ctx is None for key {key}"
+                if not result.ctx.zip_is_complete():
+                    return False
+
         for key in keys_to_wait:
             assert key in put_results, f"Key {key} not in put_results"
 
             result = put_results[key]
             assert result.ctx is not None, f"Task ctx is None for key {key}"
-
-            if not wait:
-                if not result.ctx.zip_is_complete():
-                    return False
-            else:
-                result.ctx.zip_wait()
+            result.ctx.zip_wait()
+            result.ctx = None
 
             assert result.cpu_tensors is not None
             self.chunk_pool.release(result.cpu_tensors)

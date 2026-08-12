@@ -16,6 +16,7 @@ from setuptools.command.build_ext import build_ext
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 DEVICE = os.getenv("DEVICE", "cuda")
+PACKAGE_INCLUDES = ["iaxl", "iaxl.*", "kvshrink", "kvshrink.*"]
 
 
 def _is_cuda() -> bool:
@@ -97,7 +98,7 @@ class CMakeBuild(build_ext):
 
 
 def get_package_data():
-    packages = find_packages(include=["iaxl", "iaxl.*"])
+    packages = find_packages(include=PACKAGE_INCLUDES)
     package_data = {}
     patterns = ["*.so", "*.sh", "*.patch"]
 
@@ -124,7 +125,7 @@ setup(
     version="0.10.0",
     description="intel-accel-for-llm",
     author="bin.yang@intel.com",
-    packages=find_packages(include=["iaxl", "iaxl.*"]),
+    packages=find_packages(include=PACKAGE_INCLUDES),
     python_requires=">=3.10",
     ext_modules=ext_modules,
     cmdclass={"build_ext": CMakeBuild},
