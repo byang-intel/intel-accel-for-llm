@@ -4,7 +4,7 @@ FROM $BASE
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update -y \
-    && apt-get install -y vim git iproute2 wget curl python3-pip pkg-config libboost-all-dev libudev-dev nasm yasm liblz4-dev libsqlite3-dev zlib1g-dev \
+    && apt-get install -y vim git iproute2 wget curl python3-pip pkg-config libboost-all-dev libudev-dev nasm yasm liblz4-dev libsqlite3-dev zlib1g-dev libtcmalloc-minimal4 \
         $(apt-cache search "linux-headers-5.15.*-generic" | tail -n 1 | awk '{print $1}') \
     && rm -rf /var/lib/apt/lists/*
 
