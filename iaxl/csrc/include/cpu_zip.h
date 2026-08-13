@@ -1,0 +1,31 @@
+// Copyright (C) 2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef CPU_ZIP_H
+#define CPU_ZIP_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+int cpu_zip_init(void);
+
+int cpu_zip_num_slots(void);
+
+int cpu_zip_queue_depth(void);
+
+int cpu_zip_src_cap(void);
+
+int cpu_zip_compress(int slot, void *src, int len);
+int cpu_zip_decompress(int slot, void *src, int len);
+
+int cpu_zip_wait(int slot, void **dest, int *len);
+
+void cpu_zip_shutdown(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

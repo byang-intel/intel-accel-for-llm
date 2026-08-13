@@ -250,8 +250,8 @@ static void instance_teardown(Instance *d) {
 
 int qat_zip_init(void) {
     g_instances_per_device = envs.IAXL_QAT_ZIP_INSTANCES_PER_DEVICE;
-    g_src_cap = (uint32_t)envs.IAXL_QAT_ZIP_SRC_CAP;
-    g_dst_cap = (uint32_t)envs.IAXL_QAT_ZIP_DST_CAP;
+    g_src_cap = (uint32_t)envs.IAXL_ZIP_SRC_CAP;
+    g_dst_cap = (uint32_t)envs.IAXL_ZIP_DST_CAP;
     g_queue_depth = envs.IAXL_QAT_ZIP_QUEUE_DEPTH;
 
     if (g_instances_per_device < 1)
@@ -306,14 +306,16 @@ static int submit_slot(int slot, int compress, void *src, int len) {
         return -1;
     if (!src || len <= 0)
         return -1;
-    IAXL_CHECK((uint32_t)len <= g_buf_cap, "qat_zip: input length exceeds DMA buffer capacity");
+    uint32_t input_cap = compress ? g_src_cap : g_dst_cap;
+    uint32_t output_cap = compress ? g_dst_cap : g_src_cap;
+    IAXL_CHECK((uint32_t)len <= input_cap, "qat_zip: input length exceeds configured capacity");
 
     Instance *in = &g_inst[slot / g_queue_depth];
     int si = slot % g_queue_depth;
     Slot *sl = &in->slot[si];
 
     memcpy(sl->in, src, (size_t)len);
-    return submit_op(in, si, compress, sl->in, (uint32_t)len, sl->out, g_buf_cap);
+    return submit_op(in, si, compress, sl->in, (uint32_t)len, sl->out, output_cap);
 }
 
 int qat_zip_compress(int slot, void *src, int len) { return submit_slot(slot, 1, src, len); }

@@ -64,8 +64,10 @@ file(GLOB TORCH_EXT_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/torch_ext/*.cpp")
 file(GLOB KV_POOL_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/kv_pool/*.cpp")
 file(GLOB KV_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/kv_zip/*.cpp")
 file(GLOB QAT_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/qat_zip/*.c")
+file(GLOB CPU_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/cpu_zip/*.c")
 file(GLOB COMMON_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/common/*.c")
-set(IAXL_SRCS ${TORCH_EXT_SRCS} ${KV_POOL_SRCS} ${KV_ZIP_SRCS} ${QAT_ZIP_SRCS} ${COMMON_SRCS})
+set(IAXL_SRCS ${TORCH_EXT_SRCS} ${KV_POOL_SRCS} ${KV_ZIP_SRCS} ${QAT_ZIP_SRCS} ${CPU_ZIP_SRCS}
+              ${COMMON_SRCS})
 
 if(DEVICE STREQUAL "cuda")
     list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/cuda.cpp" "${IAXL_CSRC_DIR}/kv_xfer/dsa.cpp")
@@ -103,7 +105,8 @@ target_include_directories(
             "${IAXL_CSRC_DIR}/include" "${IAXL_CSRC_DIR}/torch_ext"
             "${IAXL_CSRC_DIR}/qat_zip/include")
 target_link_directories(torch_ext PRIVATE "${PYTORCH_PATH}/lib" "${IAXL_LIB_DIR}")
-target_link_libraries(torch_ext PRIVATE torch torch_python qat_s usdm_drv_s)
+find_package(ZLIB REQUIRED)
+target_link_libraries(torch_ext PRIVATE torch torch_python qat_s usdm_drv_s ZLIB::ZLIB)
 
 if(DEVICE STREQUAL "cuda")
     find_package(CUDAToolkit REQUIRED)

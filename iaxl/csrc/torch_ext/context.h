@@ -185,10 +185,12 @@ inline TaskQueue &d2h_queue() {
 inline TaskQueue &omp_queue() {
     static TaskQueue queue("OMP-Main");
     static const bool initialized = []() {
-        int qat_threads = envs.IAXL_QAT_INSTANCE_NUM;
+    int omp_threads = envs.IAXL_OMP_THREAD_NUM;
 
-#pragma omp parallel num_threads(qat_threads)
+#pragma omp parallel num_threads(omp_threads)
         {
+        IAXL_CHECK(omp_get_num_threads() == omp_threads,
+               "omp_queue: OpenMP did not create the configured worker team");
             int tid = omp_get_thread_num();
             std::string name = "OMP-" + std::to_string(tid);
             profiler::set_thread_name(name.c_str());

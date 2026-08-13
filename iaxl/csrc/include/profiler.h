@@ -208,9 +208,10 @@ inline void set_thread_name(const char *name) {
 
     pid_t pid = getpid();
     pid_t tid = syscall(SYS_gettid);
+    /*
     std::cerr << "[set_thread_name] pid=" << pid << " tid=" << tid << " name=\"" << truncated
               << "\"" << std::endl;
-
+    */
     prctl(PR_SET_NAME, truncated, 0, 0, 0);
 
     if (detail::is_profiling_enabled()) {

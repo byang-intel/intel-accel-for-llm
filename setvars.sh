@@ -2,6 +2,9 @@ export IAXL_BASE_DOCKER_IMAGE=${IAXL_BASE_DOCKER_IMAGE:-"vllm/vllm-openai:v0.23.
 export IAXL_DEV_DOCKER_IMAGE=${IAXL_DEV_DOCKER_IMAGE:-"vllm-iaxl-dev"}
 export IAXL_BUILDER_DOCKER_IMAGE=${IAXL_BUILDER_DOCKER_IMAGE:-"vllm-iaxl-builder"}
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/tools/auto_config.sh"
+
 # =============================================================================
 # Configurable runtime / build environment variables (all IAXL_* prefixed).
 # Each keeps its default unless already set in the environment; edit as needed.
@@ -12,17 +15,20 @@ export DEVICE=${DEVICE:-cuda}                 # Build backend: cuda | xpu
 export IAXL_CMAKE_ARGS=${IAXL_CMAKE_ARGS:-""} # Extra cmake flags, e.g. "-DENABLE_NVTX=OFF"
 
 # ---- Feature switches -------------------------------------------------------
-export IAXL_KV_COMPRESSION=${IAXL_KV_COMPRESSION:-1} # Enable QAT DEFLATE compression (0/1)
+export IAXL_KV_COMPRESSION=${IAXL_KV_COMPRESSION:-1} # Enable DEFLATE compression (0/1)
+export IAXL_QAT_ZIP_ENABLE=${IAXL_QAT_ZIP_ENABLE:-1} # Enable QAT compression workers (0/1)
+export IAXL_CPU_ZIP_ENABLE=${IAXL_CPU_ZIP_ENABLE:-1} # Enable CPU compression workers (0/1)
 export IAXL_DSA_GD_ENABLE=${IAXL_DSA_GD_ENABLE:-0}   # Use Intel DSA + GDRCopy transfers (0/1)
 
 # ---- vLLM ------------------------------------------------------------------
 export MODEL="${MODEL:-Qwen/Qwen3-32B}" # Hugging Face model ID or local model path
 export TP_SIZE="${TP_SIZE:-2}"            # Tensor-parallel worker count
-VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(bash "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/tools/kvshrink_cpu_auto_detect.sh" "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
+VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(cpu_auto_detect "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
 export VLLM_CPU_OMP_THREADS_BIND # Per-rank CPU affinity
-case "${IAXL_KV_COMPRESSION,,}" in
+rank_cpu_counts "$VLLM_CPU_OMP_THREADS_BIND" "$TP_SIZE" || return 1 2>/dev/null || exit 1
+case "${IAXL_QAT_ZIP_ENABLE,,}" in
     1|true|yes|on)
-        KVSHRINK_QAT_DEVICES="${KVSHRINK_QAT_DEVICES:-$(bash "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/tools/kvshrink_qat_auto_detect.sh" "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
+        KVSHRINK_QAT_DEVICES="${KVSHRINK_QAT_DEVICES:-$(qat_auto_detect "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
         export KVSHRINK_QAT_DEVICES # Per-rank QAT device indices
         ;;
     *)
@@ -31,7 +37,7 @@ case "${IAXL_KV_COMPRESSION,,}" in
 esac
 case "${IAXL_DSA_GD_ENABLE,,}" in
     1|true|yes|on)
-        KVSHRINK_DSA_DEVICES="${KVSHRINK_DSA_DEVICES:-$(bash "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/tools/kvshrink_dsa_auto_detect.sh" "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
+        KVSHRINK_DSA_DEVICES="${KVSHRINK_DSA_DEVICES:-$(dsa_auto_detect "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
         export KVSHRINK_DSA_DEVICES # Per-rank DSA work queues
         ;;
     *)
@@ -44,6 +50,8 @@ printf '%s\n' \
     "  MODEL=$MODEL" \
     "  TP_SIZE=$TP_SIZE" \
     "  IAXL_KV_COMPRESSION=$IAXL_KV_COMPRESSION" \
+    "  IAXL_QAT_ZIP_ENABLE=$IAXL_QAT_ZIP_ENABLE" \
+    "  IAXL_CPU_ZIP_ENABLE=$IAXL_CPU_ZIP_ENABLE" \
     "  IAXL_DSA_GD_ENABLE=$IAXL_DSA_GD_ENABLE" \
     "  VLLM_CPU_OMP_THREADS_BIND=$VLLM_CPU_OMP_THREADS_BIND" \
     "  KVSHRINK_QAT_DEVICES=${KVSHRINK_QAT_DEVICES:-disabled}" \
@@ -52,6 +60,8 @@ printf '%s\n' \
 # ---- Cache / compression ----------------------------------------------------
 export IAXL_KV_LOSSY_TRUNC=${IAXL_KV_LOSSY_TRUNC:-0}                     # Lossy LSB truncation: 'auto', 0 (off), or N bits
 export IAXL_KV_DATA_SHUFFLE=${IAXL_KV_DATA_SHUFFLE:-0}                   # Byte-shuffle before compression (0/1)
+export IAXL_ZIP_SRC_CAP=${IAXL_ZIP_SRC_CAP:-262144}                      # Source/decompressed block capacity (256 KiB)
+export IAXL_ZIP_DST_CAP=${IAXL_ZIP_DST_CAP:-262144}                      # Compressed-output capacity (256 KiB)
 export IAXL_CACHE_DIR=${IAXL_CACHE_DIR:-_data/kvcache}                   # Base directory for persisted cache files
 export IAXL_CACHE_STREAM_SYNC_ON_GET=${IAXL_CACHE_STREAM_SYNC_ON_GET:-0} # CPU-sync the GPU stream on get() (0/1)
 export IAXL_CACHE_CACHEGROUP_SIZE=${IAXL_CACHE_CACHEGROUP_SIZE:-100}     # Reserved entries per cache group
@@ -63,10 +73,27 @@ export IAXL_PREALLOC_LIMIT=${IAXL_PREALLOC_LIMIT:-0}                     # Cap p
 export IAXL_QAT_DEVICES=${IAXL_QAT_DEVICES:-0}                                   # Comma-separated QAT device indices, e.g. "0,1"
 export IAXL_QAT_ZIP_INSTANCES_PER_DEVICE=${IAXL_QAT_ZIP_INSTANCES_PER_DEVICE:-4} # Instances (driving threads) per device
 # QAT driving threads = number of devices x instances-per-device (override to force).
-export IAXL_QAT_INSTANCE_NUM=${IAXL_QAT_INSTANCE_NUM:-$(($(echo "$IAXL_QAT_DEVICES" | awk -F, '{print NF}') * IAXL_QAT_ZIP_INSTANCES_PER_DEVICE))}
-export IAXL_QAT_ZIP_SRC_CAP=${IAXL_QAT_ZIP_SRC_CAP:-262144}    # Source block size in bytes (256 KiB)
-export IAXL_QAT_ZIP_DST_CAP=${IAXL_QAT_ZIP_DST_CAP:-262144}    # Compressed-output cap in bytes (256 KiB)
+case "${IAXL_QAT_ZIP_ENABLE,,}" in
+    1|true|yes|on)
+        export IAXL_QAT_INSTANCE_NUM=${IAXL_QAT_INSTANCE_NUM:-$(qat_thread_count "$IAXL_QAT_DEVICES" "$IAXL_QAT_ZIP_INSTANCES_PER_DEVICE")} || return 1 2>/dev/null || exit 1
+        ;;
+    *) export IAXL_QAT_INSTANCE_NUM=0 ;;
+esac
 export IAXL_QAT_ZIP_QUEUE_DEPTH=${IAXL_QAT_ZIP_QUEUE_DEPTH:-4} # In-flight requests per instance (<= 4)
+
+# ---- CPU / OpenMP compression workers --------------------------------------
+export IAXL_RESERVED_CPU_NUM=${IAXL_RESERVED_CPU_NUM:-4} # CPUs reserved for inference and other tasks
+case "${IAXL_CPU_ZIP_ENABLE,,}" in
+    1|true|yes|on)
+        export IAXL_CPU_ZIP_THREADS=${IAXL_CPU_ZIP_THREADS:-$(cpu_zip_thread_count "$MIN_RANK_CPU_COUNT" "$IAXL_QAT_INSTANCE_NUM" "$IAXL_RESERVED_CPU_NUM")} || return 1 2>/dev/null || exit 1
+        ;;
+    *) export IAXL_CPU_ZIP_THREADS=0 ;;
+esac
+export IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS") || return 1 2>/dev/null || exit 1
+export OMP_NUM_THREADS=$IAXL_OMP_THREAD_NUM
+export OMP_THREAD_LIMIT=$IAXL_OMP_THREAD_NUM
+export OMP_MAX_ACTIVE_LEVELS=2
+validate_omp_config "$MIN_RANK_CPU_COUNT" || return 1 2>/dev/null || exit 1
 
 # ---- Intel DSA (host<->device copy accelerator, CUDA only) ------------------
 export IAXL_DSA_GD_RESET_ON_DESTROY=${IAXL_DSA_GD_RESET_ON_DESTROY:-0} # Large BAR with stable tensor VAs can keep this off for better performance (0/1)

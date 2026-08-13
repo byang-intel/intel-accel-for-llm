@@ -1,7 +1,7 @@
 DEVICE   ?= cuda
 
 
-MODULES  := qat_zip
+MODULES  := qat_zip cpu_zip
 ifeq ($(DEVICE),cuda)
 MODULES  += dsa_gd
 endif
@@ -30,6 +30,10 @@ qat_zip_LDLIBS := $(QATLIBS)
 qat_zip_DEPS   := $(QATLIBS)
 
 
+cpu_zip_SRCS   := cpu_zip/cpu_zip.c common/envs.c
+cpu_zip_LDLIBS := -lz
+
+
 dsa_gd_SRCS   := dsa_gd/dsa_gd.c dsa_gd/dsa_memcpy.c common/envs.c
 dsa_gd_CFLAGS := -std=gnu11 -D_GNU_SOURCE -fopenmp
 dsa_gd_LDLIBS := -lgdrapi -ldl -fopenmp
@@ -41,6 +45,8 @@ test_src = $(strip $(wildcard test/$(1)_test.c) $(wildcard test/$(1)_test.cpp))
 LIBS         := $(foreach m,$(MODULES),$(LIBDIR)/lib$(m).so)
 TESTS        := $(foreach m,$(MODULES),$(if $(call test_src,$(m)),$(m)_test))
 TEST_TARGETS := $(foreach m,$(MODULES),$(if $(call test_src,$(m)),test-$(m)))
+TESTS        += zip_compat_test
+TEST_TARGETS += test-zip-compat
 
 .PHONY: all test clean qat-userspace $(TEST_TARGETS)
 
@@ -81,6 +87,13 @@ endif
 endef
 
 $(foreach m,$(MODULES),$(eval $(call MODULE_template,$(m))))
+
+
+zip_compat_test: test/zip_compat_test.c $(LIBDIR)/libqat_zip.so $(LIBDIR)/libcpu_zip.so
+	$(CC) $(CFLAGS) -o $@ $< -L$(LIBDIR) -lqat_zip -lcpu_zip -lz $(RPATH) $(LDFLAGS)
+
+test-zip-compat: zip_compat_test
+	(cd test && numactl --cpunodebind=0 --membind=0 ../zip_compat_test $(ARGS))
 
 
 qat-userspace: $(QATLIBS)

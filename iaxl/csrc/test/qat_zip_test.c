@@ -34,8 +34,8 @@ static void usage(const char *prog) {
            "Environment overrides (applied inside qat_zip_init):\n"
            "  IAXL_QAT_DEVICES                   comma-separated device indices (default 0)\n"
            "  IAXL_QAT_ZIP_INSTANCES_PER_DEVICE  instances (== threads) per device\n"
-           "  IAXL_QAT_ZIP_SRC_CAP               source block size in bytes\n"
-           "  IAXL_QAT_ZIP_DST_CAP               compressed-output cap in bytes\n"
+           "  IAXL_ZIP_SRC_CAP                   source block size in bytes\n"
+           "  IAXL_ZIP_DST_CAP                   compressed-output cap in bytes\n"
            "  IAXL_QAT_ZIP_QUEUE_DEPTH           in-flight requests per instance\n",
            prog);
 }

@@ -17,6 +17,14 @@ static inline int env_int(const char *name, int fallback) {
     return x > 0 ? x : fallback;
 }
 
+static inline int env_nonnegative_int(const char *name, int fallback) {
+    const char *v = getenv(name);
+    if (!v || !*v)
+        return fallback;
+    int x = atoi(v);
+    return x >= 0 ? x : fallback;
+}
+
 static inline const char *env_str(const char *name, const char *fallback) {
     const char *v = getenv(name);
     return (v && *v) ? v : fallback;
@@ -35,12 +43,17 @@ static inline int env_bool(const char *name, int fallback) {
 
 struct Envs {
 
+    int IAXL_ZIP_SRC_CAP;
+    int IAXL_ZIP_DST_CAP;
+
+    bool IAXL_QAT_ZIP_ENABLE;
+    bool IAXL_CPU_ZIP_ENABLE;
     int IAXL_QAT_INSTANCE_NUM;
     const char *(*IAXL_QAT_DEVICES)(void);
     int IAXL_QAT_ZIP_INSTANCES_PER_DEVICE;
-    int IAXL_QAT_ZIP_SRC_CAP;
-    int IAXL_QAT_ZIP_DST_CAP;
     int IAXL_QAT_ZIP_QUEUE_DEPTH;
+    int IAXL_CPU_ZIP_THREADS;
+    int IAXL_OMP_THREAD_NUM;
 
     bool IAXL_KV_COMPRESSION;
     int IAXL_KV_LOSSY_TRUNC;
