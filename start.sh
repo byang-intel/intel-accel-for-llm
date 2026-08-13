@@ -31,4 +31,5 @@ docker run \
             getent group "$gid" >/dev/null 2>&1 || groupadd -g "$gid" "hostgrp$gid" 2>/dev/null || true
         done
         git config --global --add safe.directory "$PWD"
+        pip install -e . --verbose --no-build-isolation
         exec bash'

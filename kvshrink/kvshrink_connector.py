@@ -205,7 +205,13 @@ class KVShrinkConnector(KVConnectorBase_V1):
             len(existence_cache),
         )
         matched_tokens = matched_blocks * self.block_size
-        return max(0, matched_tokens - num_computed_tokens), False
+        num_new_tokens = max(0, matched_tokens - num_computed_tokens)
+        logger.info(
+            f"get_num_new_matched_tokens, req-{request.request_id}, "
+            f"externally-cached tokens: {num_new_tokens}, "
+            f"locally-cached tokens: {num_computed_tokens}"
+        )
+        return num_new_tokens, False
 
     def update_state_after_alloc(
         self,

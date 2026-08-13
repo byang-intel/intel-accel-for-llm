@@ -85,30 +85,19 @@ export IAXL_API_TIMEOUT=${IAXL_API_TIMEOUT:-60}                      # HTTP requ
 
 HOST_IP=$(ip route get 1 | awk '{print $7}' | tr -d '\n')
 export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,${HOST_IP}
-export http_proxy=http://proxy.ims.intel.com:911
+export http_proxy="${http_proxy:-}"
 export https_proxy=$http_proxy
 
 # docker
 CONTAINER_NAME=iaxl.vllm
 ENV_VARS=(
-    # common
     no_proxy
     http_proxy
     https_proxy
     HOST_IP
-    PYTHONOPTIMIZE
-    # vLLM
     MODEL
-    TP_SIZE
-    KVSHRINK_QAT_DEVICES
-    KVSHRINK_DSA_DEVICES
-    VLLM_CPU_OMP_THREADS_BIND
-    # Backend
     DEVICE
 )
-while IFS= read -r var; do
-    ENV_VARS+=("$var")
-done < <(compgen -A variable IAXL_ | sort)
 
 case "$DEVICE" in
     cuda)
@@ -123,9 +112,12 @@ case "$DEVICE" in
         ;;
 esac
 for var in "${ENV_VARS[@]}"; do
-    [[ -n "${!var}" ]] && DOCKER_RUN_ARGS+=("-e" "$var=${!var}")
+    DOCKER_RUN_ARGS+=("-e" "$var=${!var:-}")
 done
 DOCKER_RUN_ARGS+=("-e" "HF_HOME=/_data/hf_home")
 DOCKER_RUN_ARGS+=("-v" "$PWD/_data:/_data")
-DOCKER_RUN_ARGS+=("-v" "/media/model-space:/media/model-space:ro")
+if [[ -d "$MODEL" ]]; then
+    MODEL_DIR=$(realpath "$MODEL")
+    DOCKER_RUN_ARGS+=("-v" "$MODEL_DIR:$MODEL_DIR:ro")
+fi
 DOCKER_RUN_ARGS+=("-v" "$PWD:$PWD" "-w" "$PWD")

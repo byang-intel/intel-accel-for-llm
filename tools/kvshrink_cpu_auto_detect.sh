@@ -95,7 +95,7 @@ for ((rank = 0; rank < TP_SIZE; rank++)); do
         siblings=$(<"$topology/thread_siblings_list")
         [[ -n "${seen_cores[$siblings]:-}" ]] && continue
         seen_cores[$siblings]=1
-        core_groups+=("$siblings")
+        core_groups+=("$cpu")
     done < <(expand_cpu_list "$(<"$node_path/cpulist")")
 
     ranks=${ranks_per_numa[$numa]}
@@ -113,9 +113,7 @@ for ((rank = 0; rank < TP_SIZE; rank++)); do
 
     cpu_ids=()
     for ((offset = 0; offset < core_count; offset++)); do
-        while read -r cpu; do
-            cpu_ids+=("$cpu")
-        done < <(expand_cpu_list "${core_groups[$((core_start + offset))]}")
+        cpu_ids+=("${core_groups[$((core_start + offset))]}")
     done
     cpu_group=$(compress_cpu_list "${cpu_ids[@]}")
     rank_cpu_groups+=("$cpu_group")
