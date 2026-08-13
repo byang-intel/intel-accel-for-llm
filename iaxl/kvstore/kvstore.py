@@ -64,6 +64,10 @@ class KVStore:
         else:
             self.layer_names = layer_names
 
+        self.skip_compression_count = min(
+            envs.IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS, len(self.layer_names)
+        )
+
         self.has_only_mode = kv_caches is None
 
         if kv_caches:
@@ -173,6 +177,7 @@ class KVStore:
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
+            skip_compression_count=self.skip_compression_count,
         )
 
         if self.layer_names[-1] in layer_names:

@@ -67,6 +67,7 @@ export IAXL_CACHE_STREAM_SYNC_ON_GET=${IAXL_CACHE_STREAM_SYNC_ON_GET:-0} # CPU-s
 export IAXL_CACHE_CACHEGROUP_SIZE=${IAXL_CACHE_CACHEGROUP_SIZE:-100}     # Reserved entries per cache group
 export IAXL_CACHE_CACHEGROUP_NUM=${IAXL_CACHE_CACHEGROUP_NUM:-100000}    # Reserved number of cache groups
 export IAXL_PREALLOC_LIMIT=${IAXL_PREALLOC_LIMIT:-0}                     # Cap pinned scratch-pool pre-allocation (0 = unlimited)
+export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS:-1} # Store the first N KV layers without compression
 # export IAXL_DDR_POOL_SIZE_GB=...         # DDR (host) cache pool size in GB (unset = 1/10 of RAM)
 
 # ---- Intel QAT (compression accelerator) ------------------------------------

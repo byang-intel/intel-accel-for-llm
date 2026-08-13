@@ -135,7 +135,14 @@ class KVFlow:
         logger.info("CUDA/XPU streams created (lazy init, device=%s)", self.device_type)
 
     @profile_func(
-        lambda self, label, tensors, chunk_dim, chunk_indices, chunk_labels, description: (
+        lambda self,
+        label,
+        tensors,
+        chunk_dim,
+        chunk_indices,
+        chunk_labels,
+        description="",
+        skip_compression_count=0: (
             f"({description},count={len(chunk_indices)})"
         )
     )
@@ -147,6 +154,7 @@ class KVFlow:
         chunk_indices: List[int],
         chunk_labels: List[str],
         description: str = "",
+        skip_compression_count: int = 0,
     ) -> Dict[str, Task]:
 
         self._ensure_streams()
@@ -176,7 +184,7 @@ class KVFlow:
         del chunk_shape[chunk_dim]
         chunk_shape = tuple(chunk_shape)
 
-        for tensor_key, tensor in tensors.items():
+        for tensor_index, (tensor_key, tensor) in enumerate(tensors.items()):
             cpu_tensors = self.chunk_pool.allocate(
                 num_chunks, chunk_shape, tensor.dtype
             )
@@ -194,7 +202,10 @@ class KVFlow:
             ctx.xfer_chunks_batch(chunk_indices, cpu_tensors)
             ctx.xfer_finish()
 
-            ctx.zip_to_mem(self.mem, label, tensor_key, chunk_labels, cpu_tensors)
+            compress = tensor_index >= skip_compression_count
+            ctx.zip_to_mem(
+                self.mem, label, tensor_key, chunk_labels, cpu_tensors, compress
+            )
 
             results[tensor_key] = Task(
                 ctx=ctx,

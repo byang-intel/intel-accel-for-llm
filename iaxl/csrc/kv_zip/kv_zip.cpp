@@ -101,8 +101,28 @@ static void zip_pipeline(size_t n, Submit &&submit, Complete &&complete) {
 }
 
 void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vector<char *> &out_bufs,
-                           std::vector<size_t> &out_sizes, std::vector<size_t> &orig_sizes) {
+                           std::vector<size_t> &out_sizes, std::vector<size_t> &orig_sizes,
+                           bool compress) {
     const size_t n = tensors.size();
+
+    if (!compress || !envs.IAXL_KV_COMPRESSION) {
+#pragma omp parallel for schedule(OMP_SCHEDULE) num_threads(envs.IAXL_OMP_THREAD_NUM)
+        for (size_t i = 0; i < n; i++) {
+            const auto &tensor = tensors[i];
+            IAXL_CHECK(tensor.is_contiguous() && tensor.device().type() == c10::DeviceType::CPU,
+                       "kv_zip: tensor must be a contiguous CPU tensor");
+            const size_t nbytes = tensor.numel() * tensor.element_size();
+            char *buffer = static_cast<char *>(malloc(sizeof(int) * 2 + nbytes));
+            IAXL_CHECK(buffer != nullptr, "kv_zip: raw cache buffer allocation failed");
+            reinterpret_cast<int *>(buffer)[0] = 0;
+            reinterpret_cast<int *>(buffer)[1] = 0;
+            memcpy(buffer + sizeof(int) * 2, tensor.data_ptr(), nbytes);
+            out_bufs[i] = buffer;
+            out_sizes[i] = sizeof(int) * 2 + nbytes;
+            orig_sizes[i] = nbytes;
+        }
+        return;
+    }
 
     auto prep = [&](size_t i, char **data, size_t *nbytes) {
         const auto &t = tensors[i];
@@ -110,10 +130,8 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
                    "kv_zip: tensor must be a contiguous CPU tensor");
         size_t nb = t.numel() * t.element_size();
         char *p = static_cast<char *>(t.data_ptr());
-        if (envs.IAXL_KV_COMPRESSION) {
-            lossy_trunc(p, nb, t.element_size());
-            data_shuffle(p, nb, t.dtype() == torch::kBFloat16, data_shuffle_enabled());
-        }
+        lossy_trunc(p, nb, t.element_size());
+        data_shuffle(p, nb, t.dtype() == torch::kBFloat16, data_shuffle_enabled());
         orig_sizes[i] = nb;
         *data = p;
         *nbytes = nb;
@@ -128,17 +146,6 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
         out_bufs[i] = buf;
         out_sizes[i] = sizeof(int) * 2 + payload_len;
     };
-
-    if (!envs.IAXL_KV_COMPRESSION) {
-#pragma omp parallel for schedule(OMP_SCHEDULE) num_threads(envs.IAXL_OMP_THREAD_NUM)
-        for (size_t i = 0; i < n; i++) {
-            char *data;
-            size_t nb;
-            prep(i, &data, &nb);
-            pack(i, data, static_cast<int>(nb));
-        }
-        return;
-    }
 
     zip_pipeline(
         n,
@@ -163,36 +170,54 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
 void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
                              const std::vector<torch::Tensor> &tensors) {
     const size_t n = tensors.size();
+    IAXL_CHECK(data_ptrs.size() == n, "kv_zip: decompression inputs must have matching lengths");
+
+    auto copy_raw = [&](size_t i) {
+        const auto &t = tensors[i];
+        const size_t nb = t.numel() * t.element_size();
+        memcpy(t.data_ptr(), data_ptrs[i] + sizeof(int) * 2, nb);
+    };
+
+    std::vector<size_t> compressed_indices;
+    compressed_indices.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        const int *header = reinterpret_cast<const int *>(data_ptrs[i]);
+        if (header[1] != 0)
+            compressed_indices.push_back(i);
+    }
+
+#pragma omp parallel for schedule(OMP_SCHEDULE) num_threads(envs.IAXL_OMP_THREAD_NUM)
+    for (size_t i = 0; i < n; i++) {
+        const int *header = reinterpret_cast<const int *>(data_ptrs[i]);
+        if (header[1] == 0)
+            copy_raw(i);
+    }
+
+    if (compressed_indices.empty())
+        return;
 
     auto finish = [&](size_t i, const void *out, int out_len) {
         const auto &t = tensors[i];
-        size_t nb = t.numel() * t.element_size();
+        const size_t nb = t.numel() * t.element_size();
         IAXL_CHECK(out_len >= 0 && static_cast<size_t>(out_len) == nb,
                    "kv_zip: decompressed size does not match tensor byte size");
         char *dst = static_cast<char *>(t.data_ptr());
         memcpy(dst, out, nb);
-        if (envs.IAXL_KV_COMPRESSION)
-            data_shuffle(dst, nb, t.dtype() == torch::kBFloat16, data_shuffle_enabled());
+        data_shuffle(dst, nb, t.dtype() == torch::kBFloat16, data_shuffle_enabled());
     };
 
-    if (!envs.IAXL_KV_COMPRESSION) {
-#pragma omp parallel for schedule(OMP_SCHEDULE) num_threads(envs.IAXL_OMP_THREAD_NUM)
-        for (size_t i = 0; i < n; i++) {
-            const int *hdr = reinterpret_cast<const int *>(data_ptrs[i]);
-            finish(i, data_ptrs[i] + sizeof(int) * 2, hdr[1]);
-        }
-        return;
-    }
-
-    for (size_t i = 0; i < n; i++) {
+    const size_t compressed_count = compressed_indices.size();
+    for (size_t item = 0; item < compressed_count; item++) {
+        const size_t i = compressed_indices[item];
         const int encoded_len = reinterpret_cast<const int *>(data_ptrs[i])[0];
         IAXL_CHECK(encoded_len != 0 && encoded_len != INT_MIN,
                    "kv_zip: invalid compressed payload length");
     }
 
     zip_pipeline(
-        n,
-        [&](ZipBackend backend, int slot, size_t i) {
+        compressed_count,
+        [&](ZipBackend backend, int slot, size_t item) {
+            const size_t i = compressed_indices[item];
             const int *hdr = reinterpret_cast<const int *>(data_ptrs[i]);
             const char *payload = data_ptrs[i] + sizeof(int) * 2;
             const int payload_len = hdr[0] < 0 ? -hdr[0] : hdr[0];
@@ -201,7 +226,10 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
                                    : cpu_zip_decompress(slot, const_cast<char *>(payload), payload_len);
             IAXL_CHECK(status == 0, "kv_zip: zip decompress failed");
         },
-        [&](ZipBackend, size_t i, void *out, int out_len) { finish(i, out, out_len); });
+        [&](ZipBackend, size_t item, void *out, int out_len) {
+            const size_t i = compressed_indices[item];
+            finish(i, out, out_len);
+        });
 }
 
 } // namespace kv_zip
