@@ -2,8 +2,8 @@ export IAXL_BASE_DOCKER_IMAGE=${IAXL_BASE_DOCKER_IMAGE:-"vllm/vllm-openai:v0.23.
 export IAXL_DEV_DOCKER_IMAGE=${IAXL_DEV_DOCKER_IMAGE:-"vllm-iaxl-dev"}
 export IAXL_BUILDER_DOCKER_IMAGE=${IAXL_BUILDER_DOCKER_IMAGE:-"vllm-iaxl-builder"}
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-source "$SCRIPT_DIR/tools/auto_config.sh"
+TOP_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$TOP_DIR/tools/auto_config.sh"
 
 # =============================================================================
 # Configurable runtime / build environment variables (all IAXL_* prefixed).
@@ -39,6 +39,7 @@ case "${IAXL_DSA_GD_ENABLE,,}" in
     1|true|yes|on)
         KVSHRINK_DSA_DEVICES="${KVSHRINK_DSA_DEVICES:-$(dsa_auto_detect "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
         export KVSHRINK_DSA_DEVICES # Per-rank DSA work queues
+        export IAXL_DSA_WQS="${IAXL_DSA_WQS:-${KVSHRINK_DSA_DEVICES%%|*}}" # Use rank 0 DSA work queues by default
         ;;
     *)
         unset KVSHRINK_DSA_DEVICES

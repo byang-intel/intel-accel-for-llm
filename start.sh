@@ -1,19 +1,9 @@
 #!/bin/bash -e
 source setvars.sh
 
-DOCKERFILE=docker/Dockerfile.dev
-DOCKERFILE_SHA=$(sha256sum "$DOCKERFILE" | awk '{print $1}')
-IMAGE_SHA=$(docker image inspect -f '{{ index .Config.Labels "iaxl.dockerfile.sha" }}' \
-    "$IAXL_DEV_DOCKER_IMAGE" 2>/dev/null || true)
-
-if [[ "$DOCKERFILE_SHA" != "$IMAGE_SHA" ]]; then
-    docker build -f "$DOCKERFILE" -t "$IAXL_DEV_DOCKER_IMAGE" . \
-        --label "iaxl.dockerfile.sha=$DOCKERFILE_SHA" \
-        --build-arg "BASE=$IAXL_BASE_DOCKER_IMAGE" \
-        --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy
-else
-    echo "Dockerfile unchanged; skipping build of $IAXL_DEV_DOCKER_IMAGE"
-fi
+docker build -f docker/Dockerfile.dev -t "$IAXL_DEV_DOCKER_IMAGE" . \
+    --build-arg "BASE=$IAXL_BASE_DOCKER_IMAGE" \
+    --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy
 
 docker run \
     "${DOCKER_RUN_ARGS[@]}" \

@@ -4,3 +4,4 @@ cmake
 pybind11
 intel-openmp
 xxhash
+matplotlib
