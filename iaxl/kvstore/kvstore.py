@@ -232,7 +232,10 @@ class KVStore:
         )
 
     def get_wait(
-        self, get_results: Dict[str, Task], layer_names: Optional[List[str]] = None
+        self,
+        get_results: Dict[str, Task],
+        layer_names: Optional[List[str]] = None,
+        wait: bool = True,
     ) -> bool:
 
         if self.has_only_mode:
@@ -243,6 +246,7 @@ class KVStore:
         return self.tensorzip.get_wait(
             get_results,
             tensor_dict_keys=layer_names,
+            wait=wait,
         )
 
     def has(self, block_hashs: Optional[List[str]] = None) -> List[bool]:
