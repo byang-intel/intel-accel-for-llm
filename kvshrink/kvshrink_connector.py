@@ -29,28 +29,20 @@ if TYPE_CHECKING:
 
 from iaxl import KVStore, generate_block_hashs, setup_root_logger
 
+from .async_load_config import load_async_load_layer_config_from_env
+
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
 
-# Async KV load concurrency threshold:
-#   -1 = always sync (default), 0 = always async,
-#   N (>0) = use async load when the number of in-flight requests >= N.
-LOAD_KV_ASYNC_THRESHOLD = int(
-    os.getenv("KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD", "-1")
-)
-# Async early-start layer count (requires LOAD_KV_ASYNC_THRESHOLD >= 0):
-#   -1 = disabled (wait for all layers before marking the load finished),
-#   N (>=1) = mark the load finished once the first N layers are loaded; the
-#   remaining layers are waited on-demand during the prefill forward pass.
-ASYNC_LOAD_LAYER = int(os.getenv("KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS", "-1"))
-
 ReqId = str
+
 
 @dataclass
 class ReqMeta:
     block_ids: list[int] = field(default_factory=list)
     block_hashes: list[str] = field(default_factory=list)
     is_async: bool = False
+    async_load_layers: int = -1
 
 
 @dataclass
@@ -60,6 +52,7 @@ class ReqState:
     existence_cache: list[bool] = field(default_factory=list)
     block_hashes: list[str] = field(default_factory=list)
     is_async: bool = False
+    async_load_layers: int = -1
 
 
 @dataclass
@@ -72,8 +65,14 @@ class RequestMetadata:
         block_ids: list[int],
         block_hashes: list[str],
         is_async: bool = False,
+        async_load_layers: int = -1,
     ) -> None:
-        self.requests[req_id] = ReqMeta(block_ids, block_hashes, is_async)
+        self.requests[req_id] = ReqMeta(
+            block_ids,
+            block_hashes,
+            is_async,
+            async_load_layers,
+        )
 
 
 @dataclass
@@ -124,27 +123,17 @@ class KVShrinkConnector(KVConnectorBase_V1):
         # Async load bookkeeping (worker side).
         # Per-request tasks still loading across scheduler steps.
         self._pending_load_tasks: dict[ReqId, dict[str, Any]] = {}
+        # Early-start layer count selected for each pending async request.
+        self._pending_load_layers: dict[ReqId, int] = {}
         # Tasks early-promoted (first N layers done) whose remaining layers are
         # waited on-demand in wait_for_layer_load during the prefill forward.
         self._early_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
         # Early-promoted tasks active for the current forward pass.
         self._active_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
 
-        if LOAD_KV_ASYNC_THRESHOLD < -1:
-            raise ValueError(
-                "KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD must be at least -1, "
-                f"got {LOAD_KV_ASYNC_THRESHOLD}"
-            )
-        if ASYNC_LOAD_LAYER != -1 and not (1 <= ASYNC_LOAD_LAYER < self.num_layers):
-            raise ValueError(
-                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS must be -1 or in "
-                f"[1, {self.num_layers}), got {ASYNC_LOAD_LAYER}"
-            )
-        if ASYNC_LOAD_LAYER != -1 and LOAD_KV_ASYNC_THRESHOLD == -1:
-            raise ValueError(
-                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS requires "
-                "KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD >= 0"
-            )
+        self._async_load_layer_config = load_async_load_layer_config_from_env(
+            num_layers=self.num_layers,
+        )
 
         if role == KVConnectorRole.SCHEDULER:
             self.kvstore: Optional[KVStore] = KVStore(
@@ -253,17 +242,22 @@ class KVShrinkConnector(KVConnectorBase_V1):
         # Decide sync vs async for this request. The load can only be async when
         # there are external tokens to load and async is enabled. Concurrency is
         # approximated by the number of in-flight requests (this one included).
-        use_async = (
-            num_new_tokens > 0
-            and LOAD_KV_ASYNC_THRESHOLD >= 0
-            and len(self._req_states) >= LOAD_KV_ASYNC_THRESHOLD
+        selected_layers = self._async_load_layer_config.select(
+            len(self._req_states)
         )
+        # A dynamic-map layer value of 0 selects synchronous loading. It is not
+        # an async request that resumes before layer 0.
+        use_async = num_new_tokens > 0 and selected_layers != 0
         state.is_async = use_async
+        if use_async:
+            state.async_load_layers = selected_layers
 
         logger.info(
             f"get_num_new_matched_tokens, req-{request.request_id}, "
             f"externally-cached tokens: {num_new_tokens}, "
-            f"locally-cached tokens: {num_computed_tokens}, async={use_async}"
+            f"locally-cached tokens: {num_computed_tokens}, async={use_async}, "
+            f"selected_load_layers={selected_layers}, "
+            f"async_load_layers={state.async_load_layers}"
         )
         return num_new_tokens, use_async
 
@@ -297,6 +291,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
             list(block_ids[load_start:load_end]),
             state.block_hashes[load_start:load_end],
             is_async=state.is_async,
+            async_load_layers=state.async_load_layers,
         )
 
     def _add_request_to_save(
@@ -401,10 +396,18 @@ class KVShrinkConnector(KVConnectorBase_V1):
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
-        # Activate early-promoted tasks (first N layers already loaded) for this
-        # forward pass; wait_for_layer_load() waits on their remaining layers.
-        self._active_promoted_tasks = self._early_promoted_tasks
-        self._early_promoted_tasks = {}
+        # A no-forward batch cannot consume promoted tasks layer by layer.
+        if forward_context.attn_metadata is not None:
+            duplicates = (
+                self._active_promoted_tasks.keys()
+                & self._early_promoted_tasks.keys()
+            )
+            if duplicates:
+                raise RuntimeError(
+                    f"Duplicate promoted load tasks for requests {duplicates}"
+                )
+            self._active_promoted_tasks.update(self._early_promoted_tasks)
+            self._early_promoted_tasks = {}
 
         sync_block_ids: list[int] = []
         sync_block_hashes: list[str] = []
@@ -437,6 +440,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 block_hashs=request.block_hashes,
                 description=req_id,
             )
+            self._pending_load_layers[req_id] = request.async_load_layers
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._current_get_tasks and not self._active_promoted_tasks:
@@ -504,16 +508,18 @@ class KVShrinkConnector(KVConnectorBase_V1):
         finished_recving: set[str] = set()
         for req_id in list(self._pending_load_tasks.keys()):
             tasks = self._pending_load_tasks[req_id]
-            if ASYNC_LOAD_LAYER == -1:
+            async_load_layers = self._pending_load_layers[req_id]
+            if async_load_layers == -1:
                 # Require all layers before marking the load finished.
                 if self._store().get_wait(get_results=tasks, wait=False):
                     self._store().get_wait(get_results=tasks, wait=True)
                     del self._pending_load_tasks[req_id]
+                    del self._pending_load_layers[req_id]
                     finished_recving.add(req_id)
             else:
                 # Early promote once the first N layers are loaded; the remaining
                 # layers are waited on-demand in wait_for_layer_load().
-                first_n_layers = self._layer_names[:ASYNC_LOAD_LAYER]
+                first_n_layers = self._layer_names[:async_load_layers]
                 if self._store().get_wait(
                     get_results=tasks, layer_names=first_n_layers, wait=False
                 ):
@@ -521,6 +527,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
                         get_results=tasks, layer_names=first_n_layers, wait=True
                     )
                     del self._pending_load_tasks[req_id]
+                    del self._pending_load_layers[req_id]
                     self._early_promoted_tasks[req_id] = tasks
                     finished_recving.add(req_id)
 
@@ -540,6 +547,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
                     continue
                 self._store().get_wait(get_results=load_tasks, wait=True)
                 self._pending_load_tasks.pop(req_id, None)
+                self._pending_load_layers.pop(req_id, None)
                 self._early_promoted_tasks.pop(req_id, None)
                 self._active_promoted_tasks.pop(req_id, None)
 
