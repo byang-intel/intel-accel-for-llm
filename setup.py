@@ -15,6 +15,7 @@ from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
+VERSION = "1.5.0"
 DEVICE = os.getenv("DEVICE", "cuda")
 PACKAGE_INCLUDES = ["iaxl", "iaxl.*", "kvshrink", "kvshrink.*"]
 
@@ -82,6 +83,8 @@ class CMakeBuild(build_ext):
         else:
             raise RuntimeError("Please ensure either CUDA or XPU is available.")
 
+        cmake_args.append(f"-DIAXL_PROJECT_VERSION={VERSION}")
+
         extra_cmake_args = os.environ.get("IAXL_CMAKE_ARGS", "")
         if extra_cmake_args:
             cmake_args.extend(shlex.split(extra_cmake_args))
@@ -122,7 +125,7 @@ ext_modules.append(CMakeExtension(name="iaxl", sourcedir=ROOT_DIR))
 
 setup(
     name="iaxl",
-    version="0.10.0",
+    version=VERSION,
     description="intel-accel-for-llm",
     author="bin.yang@intel.com",
     packages=find_packages(include=PACKAGE_INCLUDES),
