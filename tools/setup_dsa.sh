@@ -2,46 +2,21 @@
 
 set -euo pipefail
 
-NWQ=${1:-8}
-NUMA=${2:-}
-
-detect_gpu_numa() {
-    local d vendor class node
-    for d in /sys/bus/pci/devices/*; do
-        vendor=$(cat "$d/vendor" 2>/dev/null || echo)
-        [[ "$vendor" == "0x10de" ]] || continue
-        class=$(cat "$d/class" 2>/dev/null || echo)
-        [[ "$class" == 0x03* ]] || continue
-        node=$(cat "$d/numa_node" 2>/dev/null || echo -1)
-        echo "$node"
-        return 0
-    done
-    echo -1
-}
-
-if [[ -z "$NUMA" ]]; then
-    NUMA=$(detect_gpu_numa)
-fi
-if [[ "$NUMA" -lt 0 ]]; then
-    echo "ERROR: could not determine GPU NUMA node; pass it as arg 2" >&2
-    exit 1
-fi
-echo "Target NUMA node (GPU): $NUMA"
+NWQ=${1:-1}
 
 DEVS=()
 for s in /sys/bus/dsa/devices/dsa[0-9]*; do
     [[ -d "$s" ]] || continue
     dev=$(basename "$s")
     [[ "$dev" =~ ^dsa[0-9]+$ ]] || continue
-    node=$(cat "$s/numa_node" 2>/dev/null || echo -1)
-    [[ "$node" == "$NUMA" ]] && DEVS+=("$dev")
+    DEVS+=("$dev")
 done
 
 if [[ ${#DEVS[@]} -eq 0 ]]; then
-    echo "ERROR: no DSA device on NUMA $NUMA" >&2
+    echo "ERROR: no DSA device" >&2
     exit 1
 fi
-echo "DSA devices on NUMA $NUMA: ${DEVS[*]}"
+echo "DSA devices: ${DEVS[*]}"
 
 for DEV in "${DEVS[@]}"; do
     ID=${DEV#dsa}
@@ -95,7 +70,7 @@ for DEV in "${DEVS[@]}"; do
     done
 done
 
-echo "Done. Configured ${#DEVS[@]} device(s) on NUMA $NUMA, $NWQ WQ each:"
+echo "Done. Configured ${#DEVS[@]} device(s), $NWQ WQ each:"
 IDS=()
 WQS=()
 for DEV in "${DEVS[@]}"; do

@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.18)
+
+if(NOT DEFINED IAXL_PROJECT_VERSION)
+    message(FATAL_ERROR "IAXL_PROJECT_VERSION must be provided by setup.py")
+endif()
+
 project(
     intel-accel-for-llm
-    VERSION 0.10.0
+    VERSION ${IAXL_PROJECT_VERSION}
     LANGUAGES C CXX)
 
 set(DEVICE
