@@ -40,6 +40,40 @@ DEFAULT_METRICS_URL = "http://127.0.0.1:18800/v1/cache/metrics"
 SEED = 42
 BLOCK_DIM = 1
 
+# Lossy codecs (LSB truncation / k4v4) don't round-trip bit-exactly; accept the
+# result when the relative L2 deviation of the restored KV cache stays under this.
+LOSSY_REL_L2_TOL = 0.2
+
+
+def lossy_modes_active() -> List[str]:
+    modes = []
+    trunc = os.environ.get("IAXL_KV_LOSSY_TRUNC", "0")
+    if trunc not in ("0", ""):
+        modes.append(f"trunc={trunc}")
+    if os.environ.get("IAXL_KV_LOSSY_K4V4", "0") == "1":
+        modes.append("k4v4")
+    return modes
+
+
+def kv_deviation(
+    kv_caches: dict, layer_names: List[str], index: torch.Tensor, expected: torch.Tensor
+) -> Tuple[float, float, float]:
+    """Relative L2 error, cosine similarity and max abs deviation vs. `expected`."""
+    exp = expected.to(torch.float32)
+    sse = sst = sact = sdot = 0.0
+    max_abs = 0.0
+    for name in layer_names:
+        act = kv_caches[name].index_select(BLOCK_DIM, index).to(torch.float32)
+        diff = act - exp
+        sse += float((diff * diff).sum())
+        sst += float((exp * exp).sum())
+        sact += float((act * act).sum())
+        sdot += float((act * exp).sum())
+        max_abs = max(max_abs, float(diff.abs().max()))
+    rel_l2 = math.sqrt(sse / sst) if sst > 0 else 0.0
+    cos = sdot / math.sqrt(sact * sst) if sact > 0 and sst > 0 else 1.0
+    return rel_l2, cos, max_abs
+
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp8_e4m3": torch.float8_e4m3fn,
@@ -326,7 +360,20 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     print("-" * 80)
     print_result("PUT", put_time, total_blocks, total_bytes)
     print_result("GET", get_time, total_blocks, total_bytes)
-    print(f"Verification: {'passed' if verified else 'FAILED'}")
+    modes = lossy_modes_active()
+    if verified:
+        # Bit-exact even under lossy settings (e.g. nothing actually got compressed).
+        print("Verification: passed (bit-exact)")
+    elif modes:
+        rel_l2, cos, max_abs = kv_deviation(kv_caches, layer_names, index, expected)
+        accepted = rel_l2 <= LOSSY_REL_L2_TOL
+        print(
+            f"Verification (lossy {', '.join(modes)}): relative L2 error {rel_l2:.4f}, "
+            f"cosine {cos:.4f}, max|Δ| {max_abs:.4g} -> "
+            f"{'ACCEPTABLE' if accepted else 'UNACCEPTABLE'} (tol {LOSSY_REL_L2_TOL:.2f})"
+        )
+    else:
+        print("Verification: FAILED")
 
     status = cache_status_rest(args.metrics_url)
     print(

@@ -23,6 +23,7 @@
 #include "qat_zip.h"
 #include "data_shuffle.h"
 #include "lossy.h"
+#include "lossy_k4v4.h"
 #include "kv_zip.h"
 
 #define OMP_SCHEDULE dynamic
@@ -124,17 +125,27 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
         return;
     }
 
-    auto prep = [&](size_t i, char **data, size_t *nbytes) {
+    auto prep = [&](size_t i, char **data, size_t *nbytes) -> bool {
         const auto &t = tensors[i];
         IAXL_CHECK(t.is_contiguous() && t.device().type() == c10::DeviceType::CPU,
                    "kv_zip: tensor must be a contiguous CPU tensor");
+        orig_sizes[i] = t.numel() * t.element_size();
+        if (lossy_k4v4_applicable(t)) {
+            // Quantize + serialize (indices || norms) into an owned scratch buffer;
+            // the zip backend copies it during compress, so it is freed right after.
+            size_t payload = 0;
+            char *buf = lossy_k4v4_serialize(t, &payload);
+            *data = buf;
+            *nbytes = payload;
+            return true;
+        }
         size_t nb = t.numel() * t.element_size();
         char *p = static_cast<char *>(t.data_ptr());
         lossy_trunc(p, nb, t.element_size());
         data_shuffle(p, nb, t.dtype() == torch::kBFloat16, data_shuffle_enabled());
-        orig_sizes[i] = nb;
         *data = p;
         *nbytes = nb;
+        return false;
     };
 
     auto pack = [&](size_t i, const void *payload, int payload_len) {
@@ -152,7 +163,7 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
         [&](ZipBackend backend, int slot, size_t i) {
             char *data;
             size_t nb;
-            prep(i, &data, &nb);
+            const bool owned = prep(i, &data, &nb);
             IAXL_CHECK(nb <= static_cast<size_t>(INT_MAX),
                        "kv_zip: tensor byte size exceeds zip integer length range");
             const int src_cap =
@@ -162,6 +173,8 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
             const int status = backend == ZipBackend::QAT
                                    ? qat_zip_compress(slot, data, static_cast<int>(nb))
                                    : cpu_zip_compress(slot, data, static_cast<int>(nb));
+            if (owned)
+                free(data);
             IAXL_CHECK(status == 0, "kv_zip: zip compress failed");
         },
         [&](ZipBackend, size_t i, void *out, int out_len) { pack(i, out, out_len); });
@@ -198,6 +211,11 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
 
     auto finish = [&](size_t i, const void *out, int out_len) {
         const auto &t = tensors[i];
+        if (lossy_k4v4_applicable(t)) {
+            // Reinterpret the payload in place and reconstruct straight into t.
+            lossy_k4v4_deserialize(out, static_cast<size_t>(out_len), t);
+            return;
+        }
         const size_t nb = t.numel() * t.element_size();
         IAXL_CHECK(out_len >= 0 && static_cast<size_t>(out_len) == nb,
                    "kv_zip: decompressed size does not match tensor byte size");

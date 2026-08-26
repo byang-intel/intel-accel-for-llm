@@ -68,11 +68,14 @@ execute_process(
 file(GLOB TORCH_EXT_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/torch_ext/*.cpp")
 file(GLOB KV_POOL_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/kv_pool/*.cpp")
 file(GLOB KV_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/kv_zip/*.cpp")
+# gemm_xeon (sglang CPU GEMM) backs the fused lossy-k4v4 codec; kept in a subdir so
+# the non-recursive KV_ZIP glob does not pick it up (it needs AMX flags, see below).
+file(GLOB GEMM_XEON_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/kv_zip/gemm_xeon/*.cpp")
 file(GLOB QAT_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/qat_zip/*.c")
 file(GLOB CPU_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/cpu_zip/*.c")
 file(GLOB COMMON_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/common/*.c")
-set(IAXL_SRCS ${TORCH_EXT_SRCS} ${KV_POOL_SRCS} ${KV_ZIP_SRCS} ${QAT_ZIP_SRCS} ${CPU_ZIP_SRCS}
-              ${COMMON_SRCS})
+set(IAXL_SRCS ${TORCH_EXT_SRCS} ${KV_POOL_SRCS} ${KV_ZIP_SRCS} ${GEMM_XEON_SRCS} ${QAT_ZIP_SRCS}
+              ${CPU_ZIP_SRCS} ${COMMON_SRCS})
 
 if(DEVICE STREQUAL "cuda")
     list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/cuda.cpp" "${IAXL_CSRC_DIR}/kv_xfer/dsa.cpp")
@@ -103,12 +106,21 @@ target_compile_definitions(
             IAXL_COMMIT_ID="${IAXL_COMMIT_ID}" IAXL_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
 target_compile_options(
     torch_ext PRIVATE -O3 -fopenmp $<$<BOOL:${BUILD_AVX512_SUPPORT}>:-mavx2;-mavx512f;-mavx512bw>)
+# The fused lossy-k4v4 codec and its gemm_xeon backend use AMX/AVX-512 intrinsics;
+# scope those flags to just those sources so other TUs (and non-AMX build hosts) are
+# unaffected. Requires a Granite Rapids / Sapphire Rapids or newer Xeon at runtime.
+set(IAXL_AMX_FLAGS
+    -mavx512f -mavx512bf16 -mavx512vl -mavx512dq -mavx512bw -mavx512vnni -mamx-tile -mamx-bf16
+    -mamx-int8 -funroll-loops)
+set_source_files_properties(
+    ${GEMM_XEON_SRCS} "${IAXL_CSRC_DIR}/kv_zip/lossy_k4v4.cpp"
+    PROPERTIES COMPILE_OPTIONS "${IAXL_AMX_FLAGS}")
 target_link_options(torch_ext PRIVATE -fopenmp)
 target_include_directories(
     torch_ext
     PRIVATE "${PYTORCH_PATH}/include" "${PYTORCH_PATH}/include/torch/csrc/api/include"
             "${IAXL_CSRC_DIR}/include" "${IAXL_CSRC_DIR}/torch_ext"
-            "${IAXL_CSRC_DIR}/qat_zip/include")
+            "${IAXL_CSRC_DIR}/qat_zip/include" "${IAXL_CSRC_DIR}/kv_zip/gemm_xeon")
 target_link_directories(torch_ext PRIVATE "${PYTORCH_PATH}/lib" "${IAXL_LIB_DIR}")
 find_package(ZLIB REQUIRED)
 target_link_libraries(torch_ext PRIVATE torch torch_python qat_s usdm_drv_s ZLIB::ZLIB)

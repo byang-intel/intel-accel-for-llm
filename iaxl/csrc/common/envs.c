@@ -66,6 +66,7 @@ __attribute__((constructor(101))) void envs_init(void) {
     envs.IAXL_KV_COMPRESSION = env_bool("IAXL_KV_COMPRESSION", 1);
     envs.IAXL_KV_LOSSY_TRUNC = env_int("IAXL_KV_LOSSY_TRUNC", 0);
     envs.IAXL_KV_DATA_SHUFFLE = env_bool("IAXL_KV_DATA_SHUFFLE", 0);
+    envs.IAXL_KV_LOSSY_K4V4 = env_bool("IAXL_KV_LOSSY_K4V4", 0);
     envs.IAXL_CACHE_CACHEGROUP_SIZE = env_int("IAXL_CACHE_CACHEGROUP_SIZE", 100);
     envs.IAXL_CACHE_CACHEGROUP_NUM = env_int("IAXL_CACHE_CACHEGROUP_NUM", 100000);
 
@@ -95,7 +96,7 @@ __attribute__((constructor(101))) void envs_init(void) {
 
          printf("[iaxl] config: qat_zip=%s cpu_zip=%s qat_instances=%d cpu_zip_threads=%d "
              "omp_threads=%d cpus=%d "
-               "compression=%s data_shuffle=%s lossy_trunc=%d dsa_gd=%s "
+               "compression=%s data_shuffle=%s lossy_trunc=%d lossy_k4v4=%s dsa_gd=%s "
                "dsa_gd_reset=%s "
                "profile=%s\n",
                envs.IAXL_QAT_ZIP_ENABLE ? "ON" : "OFF",
@@ -103,6 +104,7 @@ __attribute__((constructor(101))) void envs_init(void) {
                envs.IAXL_CPU_ZIP_THREADS,
                envs.IAXL_OMP_THREAD_NUM, cpus, envs.IAXL_KV_COMPRESSION ? "ON" : "OFF",
                envs.IAXL_KV_DATA_SHUFFLE ? "ON" : "OFF", envs.IAXL_KV_LOSSY_TRUNC,
+               envs.IAXL_KV_LOSSY_K4V4 ? "ON" : "OFF",
                envs.IAXL_DSA_GD_ENABLE ? "ON" : "OFF",
                envs.IAXL_DSA_GD_RESET_ON_DESTROY ? "ON" : "OFF", envs.IAXL_PROFILE_MODE);
     }
