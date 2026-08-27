@@ -394,12 +394,21 @@ void unpack_into(const at::Tensor &idx, const at::Tensor &norms, const Params &p
 } // namespace
 
 bool lossy_k4v4_applicable(const torch::Tensor &t) {
-    if (!lossy_k4v4_enabled())
+    const bool enabled = lossy_k4v4_enabled();
+    static std::once_flag log_once;
+    std::call_once(log_once, [enabled] {
+        fprintf(stderr, "[iaxl] lossy_k4v4 enabled=%d (bits=%ld seed=%ld)\n", enabled ? 1 : 0,
+                static_cast<long>(K4V4_BITS), static_cast<long>(K4V4_SEED));
+    });
+    if (!enabled)
         return false;
-    if (t.scalar_type() != at::kBFloat16 || t.dim() == 0)
-        return false;
+    // Enabled -> the tensor must satisfy the fused AMX path constraints, else abort.
+    IAXL_CHECK(t.scalar_type() == at::kBFloat16 && t.dim() != 0,
+               "lossy_k4v4: tensor must be bf16 with non-zero rank");
     const int64_t d = t.size(-1);
-    return d >= 32 && d <= 1024 && (d % 32 == 0);
+    IAXL_CHECK(d >= 32 && d <= 1024 && (d % 32 == 0),
+               "lossy_k4v4: head_dim must be in [32, 1024] and a multiple of 32");
+    return true;
 }
 
 char *lossy_k4v4_serialize(const torch::Tensor &t, size_t *out_size) {
