@@ -170,6 +170,13 @@ class KVStore:
 
         tensors = {name: self.kv_caches[name] for name in layer_names}
 
+        # skip_compression_count counts GLOBAL layers, but put() may be called with
+        # a single layer / subset (layerwise async), where flow compares against the
+        # per-call tensor index. Rebase onto this call's first layer so "skip the
+        # first N layers" holds regardless of how puts are batched.
+        base = self.layer_names.index(layer_names[0])
+        local_skip = max(0, self.skip_compression_count - base)
+
         result = self.tensorzip.put(
             label=self.LABEL,
             tensors=tensors,
@@ -177,7 +184,7 @@ class KVStore:
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
-            skip_compression_count=self.skip_compression_count,
+            skip_compression_count=local_skip,
         )
 
         if self.layer_names[-1] in layer_names:
