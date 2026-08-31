@@ -101,7 +101,7 @@ export IAXL_IAA_DEVICES=${IAXL_IAA_DEVICES:-auto}                               
 export IAXL_IAA_ZIP_INSTANCES_PER_DEVICE=${IAXL_IAA_ZIP_INSTANCES_PER_DEVICE:-4} # Instances (driving threads) per IAA device; a NUMA node usually owns several
 case "${IAXL_IAA_ZIP_ENABLE,,}" in
     1|true|yes|on)
-        export IAXL_IAA_INSTANCE_NUM=${IAXL_IAA_INSTANCE_NUM:-$(iaa_thread_count "$IAXL_IAA_DEVICES" "$IAXL_IAA_ZIP_INSTANCES_PER_DEVICE")} || return 1 2>/dev/null || exit 1
+    	export IAXL_IAA_INSTANCE_NUM=${IAXL_IAA_INSTANCE_NUM:-4}
         ;;
     *) export IAXL_IAA_INSTANCE_NUM=0 ;;
 esac
