@@ -101,17 +101,29 @@ static int discover_iaa_nodes(IaaNode *out, int max_nodes) {
     return n;
 }
 
+static void log_iaa_nodes(const char *tag, const IaaNode *list, int count) {
+    int devices = 0;
+    printf("[iaa_zip] %s:", tag);
+    for (int i = 0; i < count; i++) {
+        printf(" node%d=%ddev", list[i].node, list[i].devices);
+        devices += list[i].devices;
+    }
+    printf("%s (%d node(s), %d device(s))\n", count ? "" : " none", count, devices);
+}
+
 // Parses the comma separated NUMA node list used to steer job submission and attaches each
 // node's IAA device count. "auto" (the default) uses every NUMA node that owns an IAA device.
 static int select_iaa_nodes(const char *env, IaaNode *out, int max_nodes) {
     IaaNode found[MAX_NUMA_NODES];
     const int found_count = discover_iaa_nodes(found, MAX_NUMA_NODES);
+    log_iaa_nodes("discovered", found, found_count);
 
     if (!env || !*env || !strcasecmp(env, "auto")) {
         IAXL_CHECK(found_count > 0, "iaa_zip: no IAA device found under /sys/bus/dsa/devices");
         const int n = found_count < max_nodes ? found_count : max_nodes;
         for (int i = 0; i < n; i++)
             out[i] = found[i];
+        log_iaa_nodes("selected", out, n);
         return n;
     }
 
@@ -132,6 +144,7 @@ static int select_iaa_nodes(const char *env, IaaNode *out, int max_nodes) {
         n++;
     }
     IAXL_CHECK(n > 0, "iaa_zip: no valid NUMA node selected");
+    log_iaa_nodes("selected", out, n);
     return n;
 }
 
