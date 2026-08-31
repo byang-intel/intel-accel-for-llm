@@ -9,10 +9,12 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #include "qpl/qpl.h"
 
@@ -24,12 +26,16 @@
 #define MAX_INSTANCES 256
 #define MAX_QUEUE_DEPTH 4
 #define BUSY_RETRY_LIMIT 1000000
+#define PAGE_FAULT_RETRY_LIMIT 8
+#define TOUCH_STRIDE 4096
 
 typedef struct {
     qpl_job *job;
     uint8_t *in;
     uint8_t *out;
     int submitted;
+    int compress;
+    uint32_t in_len;
 } IaaSlot;
 
 typedef struct {
@@ -52,6 +58,8 @@ static int g_initialized;
 static uint32_t g_src_cap;
 static uint32_t g_dst_cap;
 static uint32_t g_buf_cap;
+static uint32_t g_job_size;
+static int g_mlock_warned;
 
 // Tallies the IAA devices owned by each NUMA node. Spreading jobs over all of them is what
 // makes throughput scale, so "auto" must not collapse to one node.
@@ -114,7 +122,7 @@ static void log_iaa_nodes(const char *tag, const IaaNode *list, int count) {
 // Parses the comma separated NUMA node list used to steer job submission and attaches each
 // node's IAA device count. "auto" (the default) uses every NUMA node that owns an IAA device.
 static int select_iaa_nodes(const char *env, IaaNode *out, int max_nodes) {
-    IaaNode found[MAX_NUMA_NODES];
+    IaaNode found[MAX_NUMA_NODES] = {{0, 0}};
     const int found_count = discover_iaa_nodes(found, MAX_NUMA_NODES);
     log_iaa_nodes("discovered", found, found_count);
 
@@ -152,12 +160,27 @@ static void *alloc_aligned(size_t size) {
     return aligned_alloc(64, (size + 63) & ~(size_t)63);
 }
 
+// mlock rules out swap and reclaim; it does not close the PROT_NONE windows AutoNUMA opens,
+// which is what iaa_zip_wait's page-fault replay is for.
+static void pin_pages(void *addr, size_t size) {
+    if (mlock(addr, size) == 0 || g_mlock_warned)
+        return;
+    g_mlock_warned = 1;
+    fprintf(stderr, "[iaa_zip] warning: mlock failed (%s), DMA buffers may be reclaimed\n",
+            strerror(errno));
+}
+
 static void slot_teardown(IaaSlot *sl) {
     if (sl->job) {
         qpl_fini_job(sl->job);
+        munlock(sl->job, g_job_size);
         free(sl->job);
         sl->job = NULL;
     }
+    if (sl->in)
+        munlock(sl->in, g_buf_cap);
+    if (sl->out)
+        munlock(sl->out, g_buf_cap);
     free(sl->in);
     free(sl->out);
     sl->in = NULL;
@@ -174,8 +197,11 @@ static int slot_init(IaaSlot *sl, uint32_t job_size, int numa_id) {
     // IAA cannot resolve page faults itself, so fault the DMA buffers in up front.
     memset(sl->in, 0, g_buf_cap);
     memset(sl->out, 0, g_buf_cap);
+    pin_pages(sl->in, g_buf_cap);
+    pin_pages(sl->out, g_buf_cap);
     if (qpl_init_job(qpl_path_hardware, sl->job) != QPL_STS_OK)
         return -1;
+    pin_pages(sl->job, job_size);
     sl->job->numa_id = numa_id;
     sl->submitted = 0;
     return 0;
@@ -218,6 +244,7 @@ int iaa_zip_init(void) {
     uint32_t job_size = 0;
     IAXL_CHECK(qpl_get_job_size(qpl_path_hardware, &job_size) == QPL_STS_OK,
                "iaa_zip: qpl_get_job_size failed");
+    g_job_size = job_size;
 
     // Interleave nodes so that consumers taking only the first N instances still
     // spread their jobs over every NUMA node.
@@ -255,40 +282,68 @@ static IaaSlot *resolve_slot(int slot) {
     return &g_inst[slot / g_queue_depth].slot[slot % g_queue_depth];
 }
 
-static int submit_slot(int slot, int compress, void *src, int len) {
-    IaaSlot *sl = resolve_slot(slot);
-    if (!sl || !src || len <= 0)
-        return -1;
-
-    const uint32_t input_cap = compress ? g_src_cap : g_dst_cap;
-    const uint32_t output_cap = compress ? g_dst_cap : g_src_cap;
-    if ((uint32_t)len > input_cap)
-        return -1;
-
-    memcpy(sl->in, src, (size_t)len);
-
+static void prepare_job(IaaSlot *sl) {
     qpl_job *job = sl->job;
-    job->op = compress ? qpl_op_compress : qpl_op_decompress;
+    job->op = sl->compress ? qpl_op_compress : qpl_op_decompress;
     job->level = qpl_default_level;
     job->huffman_table = NULL;
     job->next_in_ptr = sl->in;
-    job->available_in = (uint32_t)len;
+    job->available_in = sl->in_len;
     job->next_out_ptr = sl->out;
-    job->available_out = output_cap;
+    job->available_out = sl->compress ? g_dst_cap : g_src_cap;
     job->total_in = 0;
     job->total_out = 0;
     job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
     // QPL's compress-and-verify pass rejects single-job DEFLATE streams (QPL_STS_INTL_VERIFY_ERR),
     // so it is skipped here; decompression validates the payload end to end.
-    if (compress)
+    if (sl->compress)
         job->flags |= QPL_FLAG_DYNAMIC_HUFFMAN | QPL_FLAG_OMIT_VERIFY;
+}
 
+static qpl_status submit_job(IaaSlot *sl) {
     qpl_status status;
     int retries = 0;
-    while ((status = qpl_submit_job(job)) == QPL_STS_QUEUES_ARE_BUSY_ERR) {
+    while ((status = qpl_submit_job(sl->job)) == QPL_STS_QUEUES_ARE_BUSY_ERR)
         if (++retries > BUSY_RETRY_LIMIT)
-            return -1;
+            break;
+    return status;
+}
+
+static int is_page_fault(qpl_status status) {
+    return status == QPL_STS_INTL_PAGE_FAULT || status == QPL_STS_INTL_W_PAGE_FAULT ||
+           status == QPL_STS_INTL_TRANSLATION_PAGE_FAULT ||
+           status == QPL_STS_INTL_DRAIN_PAGE_FAULT;
+}
+
+// Work queues without block-on-fault kill a descriptor as soon as the kernel drops a mapping the
+// device needs, and NUMA balancing keeps doing that to pages that were faulted in at startup.
+// Touching them from the CPU restores the mappings so the job can be replayed.
+static void touch_slot_pages(IaaSlot *sl) {
+    volatile uint8_t *in = sl->in;
+    volatile uint8_t *out = sl->out;
+    volatile uint8_t *job = (volatile uint8_t *)sl->job;
+    for (uint32_t off = 0; off < g_buf_cap; off += TOUCH_STRIDE) {
+        in[off] = in[off];
+        out[off] = out[off];
     }
+    for (uint32_t off = 0; off < g_job_size; off += TOUCH_STRIDE)
+        job[off] = job[off];
+}
+
+static int submit_slot(int slot, int compress, void *src, int len) {
+    IaaSlot *sl = resolve_slot(slot);
+    if (!sl || !src || len <= 0)
+        return -1;
+
+    if ((uint32_t)len > (compress ? g_src_cap : g_dst_cap))
+        return -1;
+
+    memcpy(sl->in, src, (size_t)len);
+    sl->compress = compress;
+    sl->in_len = (uint32_t)len;
+    prepare_job(sl);
+
+    const qpl_status status = submit_job(sl);
     if (status != QPL_STS_OK) {
         fprintf(stderr, "[iaa_zip] %s submit failed on slot %d: qpl_status=%d\n",
                 compress ? "compress" : "decompress", slot, (int)status);
@@ -308,8 +363,17 @@ int iaa_zip_wait(int slot, void **dest, int *len) {
         return -1;
 
     qpl_status status;
-    while ((status = qpl_check_job(sl->job)) == QPL_STS_BEING_PROCESSED)
-        ;
+    for (int attempt = 0;; attempt++) {
+        while ((status = qpl_check_job(sl->job)) == QPL_STS_BEING_PROCESSED)
+            ;
+        if (!is_page_fault(status) || attempt >= PAGE_FAULT_RETRY_LIMIT)
+            break;
+        touch_slot_pages(sl);
+        prepare_job(sl);
+        status = submit_job(sl);
+        if (status != QPL_STS_OK)
+            break;
+    }
     sl->submitted = 0;
     if (status != QPL_STS_OK) {
         fprintf(stderr, "[iaa_zip] job failed on slot %d: qpl_status=%d\n", slot, (int)status);

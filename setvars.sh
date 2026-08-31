@@ -4,6 +4,7 @@ export IAXL_BUILDER_DOCKER_IMAGE=${IAXL_BUILDER_DOCKER_IMAGE:-"vllm-iaxl-builder
 
 TOP_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$TOP_DIR/tools/auto_config.sh"
+$TOP_DIR/tools/setup_system.sh
 
 # =============================================================================
 # Configurable runtime / build environment variables (all IAXL_* prefixed).
