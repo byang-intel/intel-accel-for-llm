@@ -4,6 +4,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 USE_DSA=0
 USE_NSYS=0
+PY_ARGS=()
 
 for arg in "$@"; do
     case "$arg" in
@@ -14,9 +15,7 @@ for arg in "$@"; do
             USE_NSYS=1
             ;;
         *)
-            echo "Unknown argument: $arg"
-            echo "Usage: $0 [--dsa] [--nsys]"
-            exit 1
+            PY_ARGS+=("$arg")
             ;;
     esac
 done
@@ -38,7 +37,7 @@ if [[ "$USE_NSYS" == "1" ]]; then
         --python-sampling=true \
         --python-backtrace=cuda \
         --trace-fork-before-exec=true \
-        python3 "$SCRIPT_DIR/kvstore_benchmark.py"
+        python3 "$SCRIPT_DIR/kvstore_benchmark.py" "${PY_ARGS[@]}"
 else
-    numactl --cpunodebind=0 --membind=0 python3 "$SCRIPT_DIR/kvstore_benchmark.py"
+    numactl --cpunodebind=0 --membind=0 python3 "$SCRIPT_DIR/kvstore_benchmark.py" "${PY_ARGS[@]}"
 fi

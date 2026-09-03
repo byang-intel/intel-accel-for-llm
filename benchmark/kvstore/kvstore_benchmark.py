@@ -37,12 +37,19 @@ DEFAULT_KV_CACHE_SHAPE = (2, 1024, 16, 4, 128)
 
 
 DEFAULT_METRICS_URL = "http://127.0.0.1:18800/v1/cache/metrics"
+DEFAULT_KV_DATA_DIR = "/_data/kvstore_benchmark"
+DEFAULT_MODEL_SEQ_LEN = 16384
 SEED = 42
 BLOCK_DIM = 1
+FP8_MAX = 448.0
+INT4_QMAX = 7.0
+INT4_GROUP_SIZE = 128
 
+# int4 is stored as two 4-bit values packed into one uint8.
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp8_e4m3": torch.float8_e4m3fn,
+    "int4": torch.uint8,
 }
 
 
@@ -93,10 +100,43 @@ def parse_args() -> argparse.Namespace:
         "scales with this value.",
     )
     parser.add_argument(
+        "--data-source",
+        choices=("mock", "model", "file"),
+        default=None,
+        help="Where the KV cache content comes from: a real transformer prefill, "
+        "synthetic mock data, or raw file bytes. Defaults to 'model', or to "
+        "'file' when --data-file is set.",
+    )
+    parser.add_argument(
         "--data-file",
         default=None,
         help="Optional test-data file whose bytes fill the KV cache (cycled "
         "to fit). If omitted, deterministic mock data is generated.",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("MODEL"),
+        help="Hugging Face model ID or local path used by --data-source model "
+        "(env MODEL).",
+    )
+    parser.add_argument(
+        "--model-seq-len",
+        type=int,
+        default=DEFAULT_MODEL_SEQ_LEN,
+        help="Prefill length of one forward pass when generating model data. "
+        "Must be a multiple of the block TOKENS dimension.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        default=None,
+        help="Text file tokenized (and cycled) into the prefill prompt. "
+        "If omitted, deterministic random token IDs are used.",
+    )
+    parser.add_argument(
+        "--kv-data-dir",
+        default=DEFAULT_KV_DATA_DIR,
+        help="Directory holding generated model KV cache files, named "
+        "<model>_<dtype>.pt and reused whenever they match the requested shape.",
     )
     parser.add_argument(
         "--metrics-url",
@@ -112,6 +152,18 @@ def parse_args() -> argparse.Namespace:
         parser.error("all --kv-cache-shape dimensions must be greater than 0")
     if args.num_layers <= 0:
         parser.error("--num-layers must be greater than 0")
+    if args.dtype == "int4" and shape[-1] % 2:
+        parser.error("--dtype int4 requires an even HEAD_DIM")
+    if args.data_source is None:
+        use_file = args.data_file is not None and args.data_file != "random"
+        args.data_source = "file" if use_file else "model"
+    if args.data_source == "file" and not args.data_file:
+        parser.error("--data-source file requires --data-file")
+    if args.data_source == "model":
+        if not args.model:
+            parser.error("--data-source model requires --model or the MODEL env var")
+        if args.model_seq_len <= 0 or args.model_seq_len % shape[2]:
+            parser.error("--model-seq-len must be a positive multiple of TOKENS")
     args.kv_cache_shape = shape
     return args
 
@@ -129,7 +181,36 @@ def make_block_hashes(num_blocks: int) -> List[str]:
     return [str(i) for i in range(num_blocks)]
 
 
-def generate_mock_kv_cache(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+def storage_shape(shape: Tuple[int, ...], dtype_name: str) -> Tuple[int, ...]:
+    if dtype_name == "int4":
+        return shape[:-1] + (shape[-1] // 2,)
+    return shape
+
+
+def quantize_kv(values: torch.Tensor, dtype_name: str) -> torch.Tensor:
+    """Quantize a float KV tensor [2, ...] the way vLLM does."""
+    if dtype_name == "bf16":
+        return values.to(torch.bfloat16).contiguous()
+
+    values = values.float()
+    if dtype_name == "fp8_e4m3":
+        # vLLM stores one per-tensor k_scale/v_scale per layer: scale = amax / 448.
+        reduce_dims = tuple(range(1, values.ndim))
+        scale = values.abs().amax(dim=reduce_dims, keepdim=True) / FP8_MAX
+        scaled = (values / scale.clamp_min(1e-12)).clamp_(-FP8_MAX, FP8_MAX)
+        return scaled.to(torch.float8_e4m3fn).contiguous()
+
+    # vLLM int4: symmetric group-wise uint4b8, scale = amax / 7, low nibble first.
+    head_dim = values.shape[-1]
+    group = INT4_GROUP_SIZE if head_dim % INT4_GROUP_SIZE == 0 else head_dim
+    grouped = values.unflatten(-1, (-1, group))
+    scale = (grouped.abs().amax(dim=-1, keepdim=True) / INT4_QMAX).clamp_min(1e-6)
+    codes = (grouped / scale).round_().clamp_(-8, 7).add_(8)
+    codes = codes.to(torch.uint8).flatten(-2)
+    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
+
+
+def generate_mock_kv_cache(shape: Tuple[int, ...], dtype_name: str) -> torch.Tensor:
     kv_count, cache_blocks, block_tokens, kv_heads, head_dim = shape
     latent_dim = min(32, max(8, head_dim // 8))
     generator = torch.Generator(device="cuda").manual_seed(SEED)
@@ -175,7 +256,136 @@ def generate_mock_kv_cache(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.
         .exp_()
     )
     kv_cache.mul_(channel_scales)
-    return kv_cache.to(dtype).contiguous()
+    return quantize_kv(kv_cache, dtype_name)
+
+
+def _layer_keys_values(past_key_values, index: int):
+    layers = getattr(past_key_values, "layers", None)
+    if layers is not None:
+        return layers[index].keys, layers[index].values
+    return past_key_values.key_cache[index], past_key_values.value_cache[index]
+
+
+def _to_blocks(
+    tensor: torch.Tensor, block_tokens: int, kv_heads: int, head_dim: int
+) -> torch.Tensor:
+    """[1, heads, seq, head_dim] -> [blocks, block_tokens, kv_heads, head_dim]."""
+    tokens = tensor[0].transpose(0, 1)
+    if tokens.shape[1] < kv_heads:
+        repeats = -(-kv_heads // tokens.shape[1])
+        tokens = tokens.repeat(1, repeats, 1)
+    return tokens[:, :kv_heads, :head_dim].reshape(-1, block_tokens, kv_heads, head_dim)
+
+
+def _make_token_ids(
+    tokenizer, vocab_size: int, total_tokens: int, prompt_file
+) -> torch.Tensor:
+    if prompt_file:
+        with open(prompt_file, "r", encoding="utf-8", errors="replace") as fp:
+            text = fp.read()
+        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if not ids:
+            raise ValueError(f"prompt file {prompt_file!r} produced no tokens")
+        ids = (ids * (-(-total_tokens // len(ids))))[:total_tokens]
+        print(f"[model] tokenized {prompt_file}, cycled to {total_tokens} tokens")
+        return torch.tensor(ids, dtype=torch.long)
+
+    generator = torch.Generator().manual_seed(SEED)
+    print(f"[model] using {total_tokens} deterministic random token IDs")
+    return torch.randint(
+        0, vocab_size, (total_tokens,), generator=generator, dtype=torch.long
+    )
+
+
+def generate_model_kv_cache(
+    shape: Tuple[int, ...], dtype_name: str, args: argparse.Namespace
+) -> List[torch.Tensor]:
+    """Prefill a real transformer and return one CPU KV tensor per model layer."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    _, cache_blocks, block_tokens, kv_heads, head_dim = shape
+    total_tokens = cache_blocks * block_tokens
+
+    print(f"[model] loading {args.model}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        dtype=torch.bfloat16,
+        device_map="cuda",
+        attn_implementation="sdpa",
+    ).eval()
+
+    token_ids = _make_token_ids(
+        tokenizer, model.config.vocab_size, total_tokens, args.prompt_file
+    )
+    num_model_layers = min(model.config.num_hidden_layers, args.num_layers)
+    parts: List[List[torch.Tensor]] = [[] for _ in range(num_model_layers)]
+    backbone = getattr(model, "model", model)  # skip the LM head, only KV is needed
+
+    for start in range(0, total_tokens, args.model_seq_len):
+        chunk = token_ids[start : start + args.model_seq_len].unsqueeze(0).to("cuda")
+        with torch.no_grad():
+            past_key_values = backbone(input_ids=chunk, use_cache=True).past_key_values
+        for layer in range(num_model_layers):
+            keys, values = _layer_keys_values(past_key_values, layer)
+            if keys.shape[-1] < head_dim:
+                raise ValueError(
+                    f"model head_dim {keys.shape[-1]} is smaller than the "
+                    f"requested HEAD_DIM {head_dim}"
+                )
+            kv = torch.stack(
+                (
+                    _to_blocks(keys, block_tokens, kv_heads, head_dim),
+                    _to_blocks(values, block_tokens, kv_heads, head_dim),
+                ),
+                dim=0,
+            )
+            parts[layer].append(kv.cpu())
+        del past_key_values
+        torch.cuda.empty_cache()
+        done = min(start + args.model_seq_len, total_tokens)
+        print(f"[model] prefilled {done}/{total_tokens} tokens")
+
+    del model
+    torch.cuda.empty_cache()
+
+    # Quantize whole layers so fp8 gets one k_scale/v_scale per layer, like vLLM.
+    layers = []
+    for part in parts:
+        merged = torch.cat(part, dim=1)[:, :cache_blocks].to("cuda")
+        part.clear()
+        layers.append(quantize_kv(merged, dtype_name).cpu())
+        del merged
+    torch.cuda.empty_cache()
+    return layers
+
+
+def model_cache_path(args: argparse.Namespace, dtype_name: str) -> str:
+    model_tag = os.path.basename(args.model.rstrip("/"))
+    return os.path.join(args.kv_data_dir, f"{model_tag}_{dtype_name}.pt")
+
+
+def load_or_generate_model_kv_cache(
+    args: argparse.Namespace, shape: Tuple[int, ...], dtype_name: str
+) -> List[torch.Tensor]:
+    path = model_cache_path(args, dtype_name)
+    expected = storage_shape(shape, dtype_name)
+    if os.path.exists(path):
+        layers = torch.load(path, map_location="cpu", weights_only=True)
+        if tuple(layers[0].shape) == expected:
+            print(f"[model] reusing {len(layers)} cached KV layers from {path}")
+            return layers
+        print(
+            f"[model] {path} holds shape {tuple(layers[0].shape)}, "
+            f"regenerating for {expected}"
+        )
+        del layers
+
+    layers = generate_model_kv_cache(shape, dtype_name, args)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(layers, path)
+    print(f"[model] saved {len(layers)} KV layers to {path}")
+    return layers
 
 
 def load_kv_cache_from_file(
@@ -226,13 +436,14 @@ def run_benchmark(args: argparse.Namespace) -> bool:
         return False
 
     shape: Tuple[int, ...] = args.kv_cache_shape
+    store_shape = storage_shape(shape, args.dtype)
     dtype = DTYPE_MAP[args.dtype]
     num_layers = args.num_layers
     cache_blocks = shape[BLOCK_DIM]
 
     block_indices = list(range(0, cache_blocks, 2))
     num_blocks = len(block_indices)
-    bytes_per_block = math.prod(shape) // cache_blocks * dtype.itemsize
+    bytes_per_block = math.prod(store_shape) // cache_blocks * dtype.itemsize
 
     total_blocks = num_blocks * num_layers
     total_bytes = bytes_per_block * num_blocks * num_layers
@@ -245,24 +456,38 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     print(f"KV cache shape: {list(shape)} (one layer)")
     print(f"Layers:         {num_layers}")
     print(f"Blocks tested:  {num_blocks} (even indices, strided) x {num_layers} layers")
-    print(f"Dtype:          {dtype}")
+    print(f"Dtype:          {args.dtype}")
+    if store_shape != shape:
+        print(f"Stored shape:   {list(store_shape)} ({dtype}, two int4 per byte)")
+    print(f"Data source:    {args.data_source}")
     print(f"Transfer size:  {format_bytes(total_bytes)}")
 
-    if args.data_file is None or args.data_file == "random":
-        print("\nGenerating mock KV cache data...")
-        base = generate_mock_kv_cache(shape, dtype)
+    if args.data_source == "model":
+        print(f"\nBuilding KV cache from {args.model}...")
+        layers = load_or_generate_model_kv_cache(args, shape, args.dtype)
+        kv_caches = {
+            name: layers[i % len(layers)].to("cuda")
+            for i, name in enumerate(layer_names)
+        }
+        del layers
     else:
-        print(f"\nLoading KV cache from {args.data_file}...")
-        base = load_kv_cache_from_file(args.data_file, shape, dtype)
-
-    kv_caches = {name: base.clone() for name in layer_names}
-    del base
+        if args.data_source == "file":
+            print(f"\nLoading KV cache from {args.data_file}...")
+            base = load_kv_cache_from_file(args.data_file, store_shape, dtype)
+        else:
+            print("\nGenerating mock KV cache data...")
+            base = generate_mock_kv_cache(shape, args.dtype)
+        kv_caches = {name: base.clone() for name in layer_names}
+        del base
 
     index = torch.tensor(
         [block_indices[0], block_indices[num_blocks // 2], block_indices[-1]],
         device="cuda",
     )
-    expected = kv_caches[layer_names[0]].index_select(BLOCK_DIM, index).clone()
+    expected = {
+        name: tensor.index_select(BLOCK_DIM, index).clone()
+        for name, tensor in kv_caches.items()
+    }
 
     block_hashes = make_block_hashes(num_blocks)
 
@@ -318,8 +543,8 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     get_time = time.perf_counter() - start
 
     verified = all(
-        torch.equal(kv_caches[name].index_select(BLOCK_DIM, index), expected)
-        for name in layer_names
+        torch.equal(tensor.index_select(BLOCK_DIM, index), expected[name])
+        for name, tensor in kv_caches.items()
     )
 
     print("\nResults")
