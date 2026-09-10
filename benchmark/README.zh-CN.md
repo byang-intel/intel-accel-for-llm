@@ -33,3 +33,15 @@ python3 benchmark/kvstore/kvstore_benchmark.py --dtype int4 \
 ```bash
 bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh
 ```
+
+加上 `--flamegraph` 可使用 `perf record` 采样。perf 通过 control FIFO 控制，因此只采集计时迭代（不含 warmup），并覆盖进程的所有线程，包括 IAXL DSA 的原生工作线程。运行后会生成火焰图 SVG、供 `flamegraph.pl` 或 speedscope 使用的 `.folded` 文件，并保留原始 `perf.data` 以供 `perf report` 分析。
+
+```bash
+bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh --flamegraph tensor_xfer_flame.svg
+```
+
+要求容器内已安装 `perf`，且宿主机 `kernel.perf_event_paranoid <= 2`。二进制文件未保留帧指针时可用 `--flamegraph-call-graph dwarf`，`--flamegraph-freq` 用于调整采样频率。采样会干扰计时，因此仅用于分析，不要用于上报性能数据。
+
+```bash
+bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh --flamegraph tensor_xfer_flame.svg
+```

@@ -26,6 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from iaxl.tensor_ops import SliceCopier
+from iaxl.utils.flamegraph import PerfRecorder
 
 
 DEFAULT_FRAG_SIZES = "4K,16K,32K,64K,128K,256K,512K,1M,2M"
@@ -35,6 +36,7 @@ METHOD_COLORS = {
     "Triton kernel": "#2ca02c",
     "IAXL DSA": "#1f77b4",
 }
+RECORDER: PerfRecorder | None = None
 
 
 def parse_size(value: str) -> int:
@@ -149,11 +151,21 @@ class Result:
         return self.total_bytes / (self.milliseconds / 1000) / 1e9
 
 
-def measure(operation, *, cuda_timing: bool, warmup: int, iterations: int) -> float:
+def measure(
+    operation,
+    *,
+    cuda_timing: bool,
+    warmup: int,
+    iterations: int,
+    label: tuple[str, ...] = (),
+) -> float:
     for _ in range(warmup):
         operation()
     torch.cuda.synchronize()
 
+    # Sampling starts after warmup so the flame graph only covers timed work.
+    if RECORDER is not None:
+        RECORDER.start(label)
     best = float("inf")
     for _ in range(iterations):
         if cuda_timing:
@@ -169,6 +181,8 @@ def measure(operation, *, cuda_timing: bool, warmup: int, iterations: int) -> fl
             operation()
             elapsed = (time.perf_counter() - start_time) * 1000
         best = min(best, elapsed)
+    if RECORDER is not None:
+        RECORDER.stop()
     return best
 
 
@@ -195,6 +209,7 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
     directions = ("H2D", "D2H") if args.direction == "both" else (args.direction.upper(),)
     for direction in directions:
         h2d = direction == "H2D"
+        label = (direction, format_size(frag_bytes))
         host = source.clone().pin_memory()
         gpu = torch.empty(elements, dtype=torch.int16, device="cuda")
         if not h2d:
@@ -222,7 +237,11 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
 
         clear_destination()
         elapsed = measure(
-            cuda_copy, cuda_timing=True, warmup=args.warmup, iterations=args.iterations
+            cuda_copy,
+            cuda_timing=True,
+            warmup=args.warmup,
+            iterations=args.iterations,
+            label=label + ("CUDA copy_",),
         )
         results.append(Result("CUDA copy_", direction, elapsed, total_bytes, valid()))
 
@@ -251,6 +270,7 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
                 cuda_timing=True,
                 warmup=args.warmup,
                 iterations=args.iterations,
+                label=label + ("cudaMemcpy3DBatchAsync",),
             )
         results.append(
             Result("cudaMemcpy3DBatchAsync", direction, elapsed, total_bytes, valid())
@@ -273,7 +293,11 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
 
         clear_destination()
         elapsed = measure(
-            triton_copy, cuda_timing=True, warmup=args.warmup, iterations=args.iterations
+            triton_copy,
+            cuda_timing=True,
+            warmup=args.warmup,
+            iterations=args.iterations,
+            label=label + ("Triton kernel",),
         )
         results.append(Result("Triton kernel", direction, elapsed, total_bytes, valid()))
 
@@ -296,6 +320,7 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
             cuda_timing=False,
             warmup=args.warmup,
             iterations=args.iterations,
+            label=label + ("IAXL DSA",),
         )
         results.append(Result("IAXL DSA", direction, elapsed, total_bytes, valid()))
 
@@ -346,6 +371,7 @@ def plot_results(
 
 
 def main() -> None:
+    global RECORDER
     parser = argparse.ArgumentParser(
         description="Compare fragmented H2D/D2H copies using CUDA, Triton, and IAXL DSA."
     )
@@ -361,6 +387,26 @@ def main() -> None:
         metavar="PATH",
         help="output plot path; use an empty string to disable plotting",
     )
+    parser.add_argument(
+        "--flamegraph",
+        default="",
+        metavar="PATH",
+        help="record the timed iterations (warmup excluded) with perf and write a "
+        "flame graph SVG; a .folded file is written next to it",
+    )
+    parser.add_argument(
+        "--flamegraph-freq",
+        type=int,
+        default=999,
+        metavar="HZ",
+        help="perf sampling frequency",
+    )
+    parser.add_argument(
+        "--flamegraph-call-graph",
+        choices=("fp", "dwarf", "lbr"),
+        default="fp",
+        help="perf call-graph unwinding mode",
+    )
     args = parser.parse_args()
     if isinstance(args.frag_sizes, str):
         args.frag_sizes = parse_sizes(args.frag_sizes)
@@ -370,6 +416,10 @@ def main() -> None:
 #        parser.error("set IAXL_DSA_GD_ENABLE=1 to benchmark IAXL DSA")
 
     torch.manual_seed(42)
+    if args.flamegraph:
+        RECORDER = PerfRecorder(
+            frequency=args.flamegraph_freq, call_graph=args.flamegraph_call_graph
+        )
     print(f"{'Direction':9} {'Fragment':>10} {'Method':24} {'ms':>10} {'GB/s':>10} Check")
     all_results: dict[str, dict[int, list[Result]]] = {}
     for frag_bytes in args.frag_sizes:
@@ -383,6 +433,13 @@ def main() -> None:
             )
     if args.plot:
         plot_results(all_results, args.frag_sizes, args.plot)
+    if RECORDER is not None:
+        folded = f"{os.path.splitext(args.flamegraph)[0]}.folded"
+        RECORDER.write_folded(folded)
+        RECORDER.write_svg(args.flamegraph, title="tensor_xfer measured iterations")
+        print(f"Flame graph saved to {args.flamegraph} ({RECORDER.samples} samples)")
+        print(f"Folded stacks saved to {folded}")
+        print(f"perf data kept at {RECORDER.data_path}")
 
 
 if __name__ == "__main__":
