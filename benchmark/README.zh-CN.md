@@ -34,6 +34,14 @@ python3 benchmark/kvstore/kvstore_benchmark.py --dtype int4 \
 bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh
 ```
 
+用 `--direction h2d` 或 `--direction d2h` 只跑单个方向，用 `--methods` 只跑部分方法（`cuda`、`batch`、`triton`、`iaxl`）：
+
+```bash
+bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh --direction h2d --methods iaxl cuda
+```
+
+所有生成的文件都放在 `/_data/tensor_xfer_benchmark`，可用 `--output-dir` 修改。
+
 加上 `--flamegraph` 可使用 `perf record` 采样。perf 通过 control FIFO 控制，因此只采集计时迭代（不含 warmup），并覆盖进程的所有线程，包括 IAXL DSA 的原生工作线程。运行后会生成火焰图 SVG、供 `flamegraph.pl` 或 speedscope 使用的 `.folded` 文件，并保留原始 `perf.data` 以供 `perf report` 分析。
 
 ```bash

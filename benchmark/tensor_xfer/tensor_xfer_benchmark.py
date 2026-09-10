@@ -30,6 +30,13 @@ from iaxl.utils.flamegraph import PerfRecorder
 
 
 DEFAULT_FRAG_SIZES = "4K,16K,32K,64K,128K,256K,512K,1M,2M"
+DEFAULT_OUTPUT_DIR = "/_data/tensor_xfer_benchmark"
+METHODS = {
+    "cuda": "CUDA copy_",
+    "batch": "cudaMemcpy3DBatchAsync",
+    "triton": "Triton kernel",
+    "iaxl": "IAXL DSA",
+}
 METHOD_COLORS = {
     "CUDA copy_": "#d62728",
     "cudaMemcpy3DBatchAsync": "#ff7f0e",
@@ -64,6 +71,10 @@ def format_size(size: int) -> str:
     if size >= 1 << 10:
         return f"{size / (1 << 10):g}K"
     return f"{size}B"
+
+
+def output_path(directory: str, name: str) -> str:
+    return name if os.path.isabs(name) else os.path.join(directory, name)
 
 
 def host_cuda_view(tensor: torch.Tensor) -> torch.Tensor:
@@ -227,102 +238,106 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
             actual = dst_tensor.cpu() if dst_tensor.is_cuda else dst_tensor
             return torch.equal(actual, expected)
 
-        def cuda_copy():
-            for src_index, dst_index in zip(src_indices, dst_indices):
-                src_start = src_index * frag_elements
-                dst_start = dst_index * frag_elements
-                dst_tensor[dst_start : dst_start + frag_elements].copy_(
-                    src_tensor[src_start : src_start + frag_elements], non_blocking=True
-                )
+        if "cuda" in args.methods:
 
-        clear_destination()
-        elapsed = measure(
-            cuda_copy,
-            cuda_timing=True,
-            warmup=args.warmup,
-            iterations=args.iterations,
-            label=label + ("CUDA copy_",),
-        )
-        results.append(Result("CUDA copy_", direction, elapsed, total_bytes, valid()))
+            def cuda_copy():
+                for src_index, dst_index in zip(src_indices, dst_indices):
+                    src_start = src_index * frag_elements
+                    dst_start = dst_index * frag_elements
+                    dst_tensor[dst_start : dst_start + frag_elements].copy_(
+                        src_tensor[src_start : src_start + frag_elements], non_blocking=True
+                    )
 
-        src_byte_offsets = [index * frag_bytes for index in src_indices]
-        dst_byte_offsets = [index * frag_bytes for index in dst_indices]
-        batch_operations = build_3d_batch_ops(
-            src_tensor.data_ptr(),
-            dst_tensor.data_ptr(),
-            src_byte_offsets,
-            dst_byte_offsets,
-            frag_bytes,
-        )
-        batch_stream = torch.cuda.Stream()
-
-        def cuda_3d_batch_copy():
-            result = cuda_runtime.cudaMemcpy3DBatchAsync(
-                len(batch_operations), batch_operations, 0, batch_stream.cuda_stream
-            )
-            if result[0] != cuda_runtime.cudaError_t.cudaSuccess:
-                raise RuntimeError(f"cudaMemcpy3DBatchAsync failed: {result[0]}")
-
-        clear_destination()
-        with torch.cuda.stream(batch_stream):
+            clear_destination()
             elapsed = measure(
-                cuda_3d_batch_copy,
+                cuda_copy,
                 cuda_timing=True,
                 warmup=args.warmup,
                 iterations=args.iterations,
-                label=label + ("cudaMemcpy3DBatchAsync",),
+                label=label + ("CUDA copy_",),
             )
-        results.append(
-            Result("cudaMemcpy3DBatchAsync", direction, elapsed, total_bytes, valid())
-        )
+            results.append(Result("CUDA copy_", direction, elapsed, total_bytes, valid()))
 
-        src_view = src_tensor if src_tensor.is_cuda else host_cuda_view(src_tensor)
-        dst_view = dst_tensor if dst_tensor.is_cuda else host_cuda_view(dst_tensor)
-        src_offsets_gpu = src_offsets.cuda()
-        dst_offsets_gpu = dst_offsets.cuda()
-
-        def triton_copy():
-            copy_kernel[(fragments,)](
-                src_view,
-                dst_view,
-                src_offsets_gpu,
-                dst_offsets_gpu,
-                FRAG=frag_elements,  # pyright: ignore[reportArgumentType]
-                BLOCK=args.block,
+        if "batch" in args.methods:
+            src_byte_offsets = [index * frag_bytes for index in src_indices]
+            dst_byte_offsets = [index * frag_bytes for index in dst_indices]
+            batch_operations = build_3d_batch_ops(
+                src_tensor.data_ptr(),
+                dst_tensor.data_ptr(),
+                src_byte_offsets,
+                dst_byte_offsets,
+                frag_bytes,
             )
+            batch_stream = torch.cuda.Stream()
 
-        clear_destination()
-        elapsed = measure(
-            triton_copy,
-            cuda_timing=True,
-            warmup=args.warmup,
-            iterations=args.iterations,
-            label=label + ("Triton kernel",),
-        )
-        results.append(Result("Triton kernel", direction, elapsed, total_bytes, valid()))
+            def cuda_3d_batch_copy():
+                result = cuda_runtime.cudaMemcpy3DBatchAsync(
+                    len(batch_operations), batch_operations, 0, batch_stream.cuda_stream
+                )
+                if result[0] != cuda_runtime.cudaError_t.cudaSuccess:
+                    raise RuntimeError(f"cudaMemcpy3DBatchAsync failed: {result[0]}")
 
-        if h2d:
-            cpu_tensors = list(source_fragments.unbind())
-            iaxl_copier = SliceCopier(
-                cpu_tensors, 0, dst_indices, out=gpu.view(fragments, frag_elements)
-            )
-
-        else:
-            host_fragments = host.view(fragments, frag_elements)
-            cpu_tensors = [host_fragments[index] for index in dst_indices]
-            iaxl_copier = SliceCopier(
-                gpu.view(fragments, frag_elements), 0, src_indices, out=cpu_tensors
+            clear_destination()
+            with torch.cuda.stream(batch_stream):
+                elapsed = measure(
+                    cuda_3d_batch_copy,
+                    cuda_timing=True,
+                    warmup=args.warmup,
+                    iterations=args.iterations,
+                    label=label + ("cudaMemcpy3DBatchAsync",),
+                )
+            results.append(
+                Result("cudaMemcpy3DBatchAsync", direction, elapsed, total_bytes, valid())
             )
 
-        clear_destination()
-        elapsed = measure(
-            iaxl_copier.copy,
-            cuda_timing=False,
-            warmup=args.warmup,
-            iterations=args.iterations,
-            label=label + ("IAXL DSA",),
-        )
-        results.append(Result("IAXL DSA", direction, elapsed, total_bytes, valid()))
+        if "triton" in args.methods:
+            src_view = src_tensor if src_tensor.is_cuda else host_cuda_view(src_tensor)
+            dst_view = dst_tensor if dst_tensor.is_cuda else host_cuda_view(dst_tensor)
+            src_offsets_gpu = src_offsets.cuda()
+            dst_offsets_gpu = dst_offsets.cuda()
+
+            def triton_copy():
+                copy_kernel[(fragments,)](
+                    src_view,
+                    dst_view,
+                    src_offsets_gpu,
+                    dst_offsets_gpu,
+                    FRAG=frag_elements,  # pyright: ignore[reportArgumentType]
+                    BLOCK=args.block,
+                )
+
+            clear_destination()
+            elapsed = measure(
+                triton_copy,
+                cuda_timing=True,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                label=label + ("Triton kernel",),
+            )
+            results.append(Result("Triton kernel", direction, elapsed, total_bytes, valid()))
+
+        if "iaxl" in args.methods:
+            if h2d:
+                cpu_tensors = list(source_fragments.unbind())
+                iaxl_copier = SliceCopier(
+                    cpu_tensors, 0, dst_indices, out=gpu.view(fragments, frag_elements)
+                )
+            else:
+                host_fragments = host.view(fragments, frag_elements)
+                cpu_tensors = [host_fragments[index] for index in dst_indices]
+                iaxl_copier = SliceCopier(
+                    gpu.view(fragments, frag_elements), 0, src_indices, out=cpu_tensors
+                )
+
+            clear_destination()
+            elapsed = measure(
+                iaxl_copier.copy,
+                cuda_timing=False,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                label=label + ("IAXL DSA",),
+            )
+            results.append(Result("IAXL DSA", direction, elapsed, total_bytes, valid()))
 
     return results
 
@@ -378,21 +393,35 @@ def main() -> None:
     parser.add_argument("--total-gib", type=float, default=0.1)
     parser.add_argument("--frag-sizes", type=parse_sizes, default=DEFAULT_FRAG_SIZES)
     parser.add_argument("--direction", choices=("h2d", "d2h", "both"), default="both")
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=tuple(METHODS),
+        default=list(METHODS),
+        metavar="NAME",
+        help=f"transfer methods to run: {', '.join(METHODS)}",
+    )
     parser.add_argument("--block", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        metavar="PATH",
+        help="directory for the plot, flame graph and perf data",
+    )
+    parser.add_argument(
         "--plot",
         default="tensor_xfer.png",
         metavar="PATH",
-        help="output plot path; use an empty string to disable plotting",
+        help="plot file name inside the output directory; empty disables plotting",
     )
     parser.add_argument(
         "--flamegraph",
         default="",
         metavar="PATH",
-        help="record the timed iterations (warmup excluded) with perf and write a "
-        "flame graph SVG; a .folded file is written next to it",
+        help="record the timed iterations (warmup excluded) with perf and write this "
+        "flame graph SVG into the output directory, together with .folded and perf.data",
     )
     parser.add_argument(
         "--flamegraph-freq",
@@ -416,9 +445,12 @@ def main() -> None:
 #        parser.error("set IAXL_DSA_GD_ENABLE=1 to benchmark IAXL DSA")
 
     torch.manual_seed(42)
+    os.makedirs(args.output_dir, exist_ok=True)
     if args.flamegraph:
         RECORDER = PerfRecorder(
-            frequency=args.flamegraph_freq, call_graph=args.flamegraph_call_graph
+            output_path(args.output_dir, "perf.data"),
+            frequency=args.flamegraph_freq,
+            call_graph=args.flamegraph_call_graph,
         )
     print(f"{'Direction':9} {'Fragment':>10} {'Method':24} {'ms':>10} {'GB/s':>10} Check")
     all_results: dict[str, dict[int, list[Result]]] = {}
@@ -432,12 +464,13 @@ def main() -> None:
                 f"{result.gbps:10.2f} {'PASS' if result.valid else 'FAIL'}"
             )
     if args.plot:
-        plot_results(all_results, args.frag_sizes, args.plot)
+        plot_results(all_results, args.frag_sizes, output_path(args.output_dir, args.plot))
     if RECORDER is not None:
-        folded = f"{os.path.splitext(args.flamegraph)[0]}.folded"
+        svg = output_path(args.output_dir, args.flamegraph)
+        folded = f"{os.path.splitext(svg)[0]}.folded"
         RECORDER.write_folded(folded)
-        RECORDER.write_svg(args.flamegraph, title="tensor_xfer measured iterations")
-        print(f"Flame graph saved to {args.flamegraph} ({RECORDER.samples} samples)")
+        RECORDER.write_svg(svg, title="tensor_xfer measured iterations")
+        print(f"Flame graph saved to {svg} ({RECORDER.samples} samples)")
         print(f"Folded stacks saved to {folded}")
         print(f"perf data kept at {RECORDER.data_path}")
 

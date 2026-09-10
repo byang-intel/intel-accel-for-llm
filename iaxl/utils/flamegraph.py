@@ -58,7 +58,9 @@ class _Node:
 class PerfRecorder:
     """Records native stacks with `perf record`, limited to marked regions."""
 
-    def __init__(self, *, frequency: int = 999, call_graph: str = "fp") -> None:
+    def __init__(
+        self, data_path: str, *, frequency: int = 999, call_graph: str = "fp"
+    ) -> None:
         assert shutil.which("perf"), "perf is not installed"
         paranoid = _perf_event_paranoid()
         assert paranoid <= 2, (
@@ -71,7 +73,7 @@ class PerfRecorder:
             trampoline("perf")
 
         self._directory = tempfile.mkdtemp(prefix="iaxl-flamegraph-")
-        self.data_path = os.path.join(self._directory, "perf.data")
+        self.data_path = data_path
         control_path = os.path.join(self._directory, "control.fifo")
         ack_path = os.path.join(self._directory, "ack.fifo")
         os.mkfifo(control_path)
@@ -168,9 +170,14 @@ class PerfRecorder:
         def flush() -> None:
             if not stack:
                 return
-            key = ";".join(self._label(starts, timestamp) + (comm,) + tuple(reversed(stack)))
-            counts[key] += 1
+            prefix = self._label(starts, timestamp)
+            stack_frames = tuple(reversed(stack))
             stack.clear()
+            # perf cannot disable events inherited by threads, so samples keep
+            # arriving between regions; only the marked regions are of interest.
+            if prefix is None:
+                return
+            counts[";".join(prefix + (comm,) + stack_frames)] += 1
 
         for line in script.stdout.splitlines():
             if not line.strip():
@@ -185,12 +192,12 @@ class PerfRecorder:
         flush()
         return dict(counts)
 
-    def _label(self, starts: list[float], timestamp: float) -> tuple[str, ...]:
+    def _label(self, starts: list[float], timestamp: float) -> tuple[str, ...] | None:
         index = bisect_right(starts, timestamp + _EDGE_SLACK) - 1
         if index < 0:
-            return ("unmatched",)
+            return None
         _, end, prefix = self._regions[index]
-        return prefix if timestamp <= end + _EDGE_SLACK else ("unmatched",)
+        return prefix if timestamp <= end + _EDGE_SLACK else None
 
     def write_folded(self, path: str) -> None:
         self.close()

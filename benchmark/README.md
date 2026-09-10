@@ -34,6 +34,14 @@ Compares fragmented H2D and D2H transfer performance using CUDA, `cudaMemcpy3DBa
 bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh
 ```
 
+Use `--direction h2d` or `--direction d2h` to run a single direction, and `--methods` to run only some of `cuda`, `batch`, `triton`, `iaxl`:
+
+```bash
+bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh --direction h2d --methods iaxl cuda
+```
+
+All generated files go to `/_data/tensor_xfer_benchmark`; change it with `--output-dir`.
+
 Add `--flamegraph` to profile with `perf record`. perf is driven through its control FIFO, so only the timed iterations are sampled (warmup is excluded), and every thread of the process is covered, including the native IAXL DSA workers. The run writes a flame graph SVG plus a `.folded` file for `flamegraph.pl` or speedscope, and keeps the raw `perf.data` for `perf report`.
 
 ```bash
