@@ -67,7 +67,7 @@ class SliceCopier:
     def copy(self) -> None:
         if not self._indices:
             return
-        self._context.xfer_chunks_batch(self._indices, self._cpu_tensors)
+        self._context.xfer_chunks_batch_fast(self._indices, self._cpu_tensors)
         self._context.xfer_finish()
         self._context.xfer_wait()
 

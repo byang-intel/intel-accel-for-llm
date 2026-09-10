@@ -50,6 +50,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("xfer_chunks_batch", &Context::xfer_chunks_batch, "Transfer batch of chunks (async)",
              py::arg("chunk_indices"), py::arg("cpu_tensors"),
              py::call_guard<py::gil_scoped_release>())
+        .def("xfer_chunks_batch_fast", &Context::xfer_chunks_batch_fast,
+             "Transfer batch of chunks (async), for callers that repeat the same transfer.\n"
+             "cpu_tensors are not type-checked. The resolved addresses are cached and reused when\n"
+             "the same two lists are passed again, so they must not be mutated in place, and a\n"
+             "different list must not be submitted before xfer_wait().",
+             py::arg("chunk_indices"), py::arg("cpu_tensors"))
         .def("xfer_finish", &Context::xfer_finish, "Record GPU event after all transfers (async)",
              py::call_guard<py::gil_scoped_release>())
         .def("xfer_wait", &Context::xfer_wait, "Wait for raw transfers to complete",

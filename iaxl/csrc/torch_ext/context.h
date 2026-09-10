@@ -64,6 +64,9 @@ class Context {
     void xfer_chunk(const torch::Tensor &cpu_tensor, int64_t chunk_idx);
     void xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
                            const std::vector<torch::Tensor> &cpu_tensors);
+    // Same transfer, but resolves the lists only when they differ from the previous call.
+    void xfer_chunks_batch_fast(const pybind11::list &chunk_indices,
+                                const pybind11::list &cpu_tensors);
     void xfer_finish();
     void xfer_wait();
     bool xfer_is_complete();
@@ -118,6 +121,10 @@ class Context {
             name_ = std::move(other.name_);
             zip_future_ = std::move(other.zip_future_);
             unzip_future_ = std::move(other.unzip_future_);
+            indices_ = std::move(other.indices_);
+            cpu_ptrs_ = std::move(other.cpu_ptrs_);
+            cached_indices_ = std::move(other.cached_indices_);
+            cached_tensors_ = std::move(other.cached_tensors_);
 
             other.xctx_ = nullptr;
             other.event_ = nullptr;
@@ -146,6 +153,12 @@ class Context {
     std::string name_;
     std::future<void> zip_future_;
     std::future<void> unzip_future_;
+
+    // Chunk list resolved by xfer_chunks_batch_fast(), keyed on the identity of the two lists.
+    std::vector<int64_t> indices_;
+    std::vector<char *> cpu_ptrs_;
+    pybind11::object cached_indices_;
+    pybind11::object cached_tensors_;
 };
 
 inline void gpu_transfer_batch_pytorch(torch::Tensor &gpu_tensor, int chunk_dim,

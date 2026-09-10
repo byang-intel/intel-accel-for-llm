@@ -3,6 +3,8 @@
 
 #include "context.h"
 
+#include <torch/csrc/autograd/python_variable.h>
+
 #include <chrono>
 #include <vector>
 
@@ -38,6 +40,46 @@ void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
         PROFILE_SCOPE_FMT("xfer_chunks_batch(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
                           stream_id_, chunk_indices.size(), chunk_indices[0]);
         kv_xfer::copy_chunks_batch(x, chunk_indices, cpu_ptrs, h2d);
+    });
+}
+
+void Context::xfer_chunks_batch_fast(const pybind11::list &chunk_indices,
+                                     const pybind11::list &cpu_tensors) {
+    const size_t n = chunk_indices.size();
+    IAXL_CHECK(n == cpu_tensors.size(),
+               "xfer_chunks_batch_fast: chunk_indices and cpu_tensors must have the same length");
+
+    // Repeated transfers hand over the very same lists, so resolve their addresses only once.
+    if (chunk_indices.ptr() != cached_indices_.ptr() || cpu_tensors.ptr() != cached_tensors_.ptr()) {
+        indices_.resize(n);
+        cpu_ptrs_.resize(n);
+
+        // Raw CPython access: the caller validates the tensors, so pybind11's per-item cast and
+        // refcount churn would cost far more than the copy itself.
+        PyObject **index_items = ((PyListObject *)chunk_indices.ptr())->ob_item;
+        PyObject **tensor_items = ((PyListObject *)cpu_tensors.ptr())->ob_item;
+        for (size_t i = 0; i < n; i++) {
+            indices_[i] = PyLong_AsLongLong(index_items[i]);
+            cpu_ptrs_[i] = (char *)THPVariable_Unpack(tensor_items[i]).data_ptr();
+        }
+        IAXL_CHECK(!PyErr_Occurred(), "xfer_chunks_batch_fast: chunk_indices must be integers");
+
+        cached_indices_ = chunk_indices;
+        cached_tensors_ = cpu_tensors;
+    }
+
+    PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
+                      stream_id_, n, indices_[0]);
+
+    bool h2d = (direction_ == GpuTransferDirection::H2D);
+    auto x = xctx_;
+    const auto *indices = &indices_;
+    const auto *cpu_ptrs = &cpu_ptrs_;
+
+    queue_->submit([=]() {
+        PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
+                          stream_id_, indices->size(), (*indices)[0]);
+        kv_xfer::copy_chunks_batch(x, *indices, *cpu_ptrs, h2d);
     });
 }
 
