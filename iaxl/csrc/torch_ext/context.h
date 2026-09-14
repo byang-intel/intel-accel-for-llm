@@ -64,9 +64,8 @@ class Context {
     void xfer_chunk(const torch::Tensor &cpu_tensor, int64_t chunk_idx);
     void xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
                            const std::vector<torch::Tensor> &cpu_tensors);
-    // Same transfer, but reads the lists without pybind11's per-tensor cast and refcounting.
-    void xfer_chunks_batch_fast(const pybind11::list &chunk_indices,
-                                const pybind11::list &cpu_tensors);
+    // Same transfer, but takes the chunk indices and CPU addresses as prebuilt int64 tensors.
+    void xfer_chunks_batch_fast(const torch::Tensor &chunk_indices, const torch::Tensor &cpu_ptrs);
     void xfer_finish();
     void xfer_wait();
     bool xfer_is_complete();

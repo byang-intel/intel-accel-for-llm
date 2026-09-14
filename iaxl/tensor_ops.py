@@ -57,7 +57,13 @@ class SliceCopier:
                 raise ValueError("slice tensors must be contiguous")
 
         self._indices = indices
+        # Kept alive so the addresses in self._cpu_ptrs stay valid.
         self._cpu_tensors = cpu_tensors
+        # Built once so copy() hands the C++ side ready-to-use arrays instead of Python lists.
+        self._chunk_indices = torch.tensor(indices, dtype=torch.int64)
+        self._cpu_ptrs = torch.tensor(
+            [tensor.data_ptr() for tensor in cpu_tensors], dtype=torch.int64
+        )
         self._work_stream = torch.cuda.Stream(device=gpu_tensor.device)
         backend = "dsa" if envs.IAXL_DSA_GD_ENABLE else "cuda"
         self._context = Context.create(
@@ -67,7 +73,7 @@ class SliceCopier:
     def copy(self) -> None:
         if not self._indices:
             return
-        self._context.xfer_chunks_batch_fast(self._indices, self._cpu_tensors)
+        self._context.xfer_chunks_batch_fast(self._chunk_indices, self._cpu_ptrs)
         self._context.xfer_finish()
         self._context.xfer_wait()
 

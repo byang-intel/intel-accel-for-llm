@@ -3,8 +3,6 @@
 
 #include "context.h"
 
-#include <torch/csrc/autograd/python_variable.h>
-
 #include <chrono>
 #include <vector>
 
@@ -43,35 +41,33 @@ void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
     });
 }
 
-void Context::xfer_chunks_batch_fast(const pybind11::list &chunk_indices,
-                                     const pybind11::list &cpu_tensors) {
-    const size_t n = chunk_indices.size();
-    IAXL_CHECK(n == cpu_tensors.size(),
-               "xfer_chunks_batch_fast: chunk_indices and cpu_tensors must have the same length");
+void Context::xfer_chunks_batch_fast(const torch::Tensor &chunk_indices,
+                                     const torch::Tensor &cpu_ptrs) {
+    const int64_t n = chunk_indices.numel();
+    IAXL_CHECK(n == cpu_ptrs.numel(),
+               "xfer_chunks_batch_fast: chunk_indices and cpu_ptrs must have the same length");
+    IAXL_CHECK(chunk_indices.scalar_type() == torch::kInt64 && chunk_indices.is_cpu() &&
+                   chunk_indices.is_contiguous() && cpu_ptrs.scalar_type() == torch::kInt64 &&
+                   cpu_ptrs.is_cpu() && cpu_ptrs.is_contiguous(),
+               "xfer_chunks_batch_fast: expected contiguous int64 CPU tensors");
 
-    std::vector<int64_t> indices(n);
-    std::vector<char *> cpu_ptrs(n);
+    const int64_t *index_data = chunk_indices.data_ptr<int64_t>();
+    char *const *ptr_data = (char *const *)cpu_ptrs.data_ptr<int64_t>();
 
-    // Raw CPython access: the caller validates the tensors, so pybind11's per-item cast and
-    // refcount churn would cost far more than the copy itself.
-    PyObject **index_items = ((PyListObject *)chunk_indices.ptr())->ob_item;
-    PyObject **tensor_items = ((PyListObject *)cpu_tensors.ptr())->ob_item;
-    for (size_t i = 0; i < n; i++) {
-        indices[i] = PyLong_AsLongLong(index_items[i]);
-        cpu_ptrs[i] = (char *)THPVariable_Unpack(tensor_items[i]).data_ptr();
-    }
-    IAXL_CHECK(!PyErr_Occurred(), "xfer_chunks_batch_fast: chunk_indices must be integers");
+    PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%ld,i0=%ld)", name_.c_str(),
+                      stream_id_, n, index_data[0]);
 
-    PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
-                      stream_id_, n, indices[0]);
+    // The caller already resolved the addresses, so this is two bulk copies instead of a scan.
+    std::vector<int64_t> indices(index_data, index_data + n);
+    std::vector<char *> ptrs(ptr_data, ptr_data + n);
 
     bool h2d = (direction_ == GpuTransferDirection::H2D);
     auto x = xctx_;
 
-    queue_->submit([=, indices = std::move(indices), cpu_ptrs = std::move(cpu_ptrs)]() {
+    queue_->submit([=, indices = std::move(indices), ptrs = std::move(ptrs)]() {
         PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
                           stream_id_, indices.size(), indices[0]);
-        kv_xfer::copy_chunks_batch(x, indices, cpu_ptrs, h2d);
+        kv_xfer::copy_chunks_batch(x, indices, ptrs, h2d);
     });
 }
 
