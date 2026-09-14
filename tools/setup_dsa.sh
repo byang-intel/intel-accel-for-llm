@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-NWQ=${1:-1}
+NWQ=${1:-4}
 
 DEVS=()
 for s in /sys/bus/dsa/devices/dsa[0-9]*; do
