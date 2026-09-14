@@ -3,6 +3,9 @@
 
 """Linux perf helper that renders folded stacks and a flame graph SVG.
 
+install perf: apt-get install -y linux-tools-$(uname -r) linux-tools-generic
+sysctl -w kernel.perf_event_paranoid=1
+
 perf samples every thread of the process, including native and kernel frames.
 Sampling runs through perf's control FIFO, so only the regions marked with
 start()/stop() reach the flame graph.
