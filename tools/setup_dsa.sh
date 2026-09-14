@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-NWQ=${1:-4}
+NWQ=${1:-1}
 
 DEVS=()
 for s in /sys/bus/dsa/devices/dsa[0-9]*; do
@@ -10,6 +10,8 @@ for s in /sys/bus/dsa/devices/dsa[0-9]*; do
     dev=$(basename "$s")
     [[ "$dev" =~ ^dsa[0-9]+$ ]] || continue
     DEVS+=("$dev")
+    node=$(cat "$s/numa_node" 2>/dev/null || echo -1)
+    echo "numa $node: $dev"
 done
 
 if [[ ${#DEVS[@]} -eq 0 ]]; then
