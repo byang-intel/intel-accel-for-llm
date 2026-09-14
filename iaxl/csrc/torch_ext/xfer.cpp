@@ -41,6 +41,36 @@ void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
     });
 }
 
+void Context::xfer_chunks_batch_fast(const torch::Tensor &chunk_indices,
+                                     const torch::Tensor &cpu_ptrs) {
+    const int64_t n = chunk_indices.numel();
+    IAXL_CHECK(n == cpu_ptrs.numel(),
+               "xfer_chunks_batch_fast: chunk_indices and cpu_ptrs must have the same length");
+    IAXL_CHECK(chunk_indices.scalar_type() == torch::kInt64 && chunk_indices.is_cpu() &&
+                   chunk_indices.is_contiguous() && cpu_ptrs.scalar_type() == torch::kInt64 &&
+                   cpu_ptrs.is_cpu() && cpu_ptrs.is_contiguous(),
+               "xfer_chunks_batch_fast: expected contiguous int64 CPU tensors");
+
+    const int64_t *index_data = chunk_indices.data_ptr<int64_t>();
+    char *const *ptr_data = (char *const *)cpu_ptrs.data_ptr<int64_t>();
+
+    PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%ld,i0=%ld)", name_.c_str(),
+                      stream_id_, n, index_data[0]);
+
+    // The caller already resolved the addresses, so this is two bulk copies instead of a scan.
+    std::vector<int64_t> indices(index_data, index_data + n);
+    std::vector<char *> ptrs(ptr_data, ptr_data + n);
+
+    bool h2d = (direction_ == GpuTransferDirection::H2D);
+    auto x = xctx_;
+
+    queue_->submit([=, indices = std::move(indices), ptrs = std::move(ptrs)]() {
+        PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
+                          stream_id_, indices.size(), indices[0]);
+        kv_xfer::copy_chunks_batch(x, indices, ptrs, h2d);
+    });
+}
+
 void Context::xfer_finish() {
     PROFILE_SCOPE_FMT("xfer_finish(%s,stream=%llu)", name_.c_str(), stream_id_);
     auto event = event_;

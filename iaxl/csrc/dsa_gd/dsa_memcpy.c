@@ -38,6 +38,8 @@
 #define DSA_MAX_XFER 2147483648
 #define DSA_ALIGN 8u
 #define ENQCMD_MAX_RETRIES 1000000u
+/* Batches kept in flight per WQ so the engine never idles while descriptors are refilled. */
+#define DSA_BATCH_DEPTH 8
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,6 +59,43 @@ static size_t g_max_xfer = DSA_MAX_XFER;
 
 static size_t g_max_batch = 1;
 
+/* Descriptor buffers, one set of DSA_BATCH_DEPTH slots per WQ, reused by every batch call. */
+static struct dsa_hw_desc *g_subs[DSA_MAX_WQ];
+static struct dsa_completion_record *g_comps[DSA_MAX_WQ];
+static struct dsa_completion_record *g_bcomps[DSA_MAX_WQ];
+
+static inline void dsa_wait_pause(const volatile uint8_t *comp) {
+#if defined(DSA_WAIT_YIELD)
+    (void)comp;
+    sched_yield();
+#elif defined(DSA_WAIT_UMWAIT)
+    _umonitor((void *)comp);
+    _umwait(C02_STATE, _rdtsc() + UMWAIT_DELAY);
+#elif defined(DSA_WAIT_TPAUSE)
+    (void)comp;
+    _tpause(C02_STATE, _rdtsc() + TPAUSE_DELAY);
+#else
+    (void)comp;
+    _mm_pause();
+#endif
+}
+
+static inline void dsa_check_timeout(const struct timespec *start, unsigned int *iterations) {
+    struct timespec now;
+    int64_t elapsed_ns;
+
+    if (++*iterations != DSA_TIMEOUT_CHECK_INTERVAL)
+        return;
+
+    IAXL_CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0,
+               "dsa: failed to read completion timeout clock");
+    elapsed_ns = (int64_t)(now.tv_sec - start->tv_sec) * 1000000000LL +
+                 (int64_t)(now.tv_nsec - start->tv_nsec);
+    IAXL_CHECK(elapsed_ns < DSA_COMPLETION_TIMEOUT_NS,
+               "dsa: completion poll timed out after 10 seconds");
+    *iterations = 0;
+}
+
 static inline void dsa_wait_completion(const volatile uint8_t *comp) {
     struct timespec start;
     unsigned int iterations = 0;
@@ -65,29 +104,29 @@ static inline void dsa_wait_completion(const volatile uint8_t *comp) {
                "dsa: failed to read completion timeout clock");
 
     while (*comp == 0) {
-#if defined(DSA_WAIT_YIELD)
-        sched_yield();
-#elif defined(DSA_WAIT_UMWAIT)
-        _umonitor((void *)comp);
-        _umwait(C02_STATE, _rdtsc() + UMWAIT_DELAY);
-#elif defined(DSA_WAIT_TPAUSE)
-        _tpause(C02_STATE, _rdtsc() + TPAUSE_DELAY);
-#else
-        _mm_pause();
-#endif
+        dsa_wait_pause(comp);
+        dsa_check_timeout(&start, &iterations);
+    }
+}
 
-        if (++iterations == DSA_TIMEOUT_CHECK_INTERVAL) {
-            struct timespec now;
-            int64_t elapsed_ns;
+/* Polls every in-flight batch and returns the index in slots[] of the first one that finishes. */
+static size_t dsa_wait_any(const volatile struct dsa_completion_record *bcomp, const size_t *slots,
+                           size_t count) {
+    struct timespec start;
+    unsigned int iterations = 0;
 
-            IAXL_CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0,
-                       "dsa: failed to read completion timeout clock");
-            elapsed_ns = (int64_t)(now.tv_sec - start.tv_sec) * 1000000000LL +
-                         (int64_t)(now.tv_nsec - start.tv_nsec);
-            IAXL_CHECK(elapsed_ns < DSA_COMPLETION_TIMEOUT_NS,
-                       "dsa: completion poll timed out after 10 seconds");
-            iterations = 0;
+    IAXL_CHECK(clock_gettime(CLOCK_MONOTONIC, &start) == 0,
+               "dsa: failed to read completion timeout clock");
+
+    for (;;) {
+        size_t k;
+
+        for (k = 0; k < count; k++) {
+            if (bcomp[slots[k]].status)
+                return k;
         }
+        dsa_wait_pause(&bcomp[slots[0]].status);
+        dsa_check_timeout(&start, &iterations);
     }
 }
 
@@ -130,6 +169,11 @@ static size_t dsa_read_wq_attr(const char *attr, size_t fallback) {
     return (size_t)val;
 }
 
+static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
+                            struct dsa_completion_record *comp,
+                            struct dsa_completion_record *bcomp, void *const dest[],
+                            const void *const src[], const size_t n[], size_t first, size_t cnt);
+
 static int dsa_submit(struct dsa_hw_desc *desc, void *portal) {
 #ifdef DSA_WQ_SHARED
     unsigned int retries = 0;
@@ -165,6 +209,9 @@ static size_t dsa_parse_wqs(void) {
 
 static int dsa_init(void) {
     void *portals[DSA_MAX_WQ] = {NULL};
+    struct dsa_hw_desc *subs[DSA_MAX_WQ] = {NULL};
+    struct dsa_completion_record *comps[DSA_MAX_WQ] = {NULL};
+    struct dsa_completion_record *bcomps[DSA_MAX_WQ] = {NULL};
     size_t num_wq, w;
     int ret = -1;
 
@@ -205,8 +252,23 @@ static int dsa_init(void) {
         portals[w] = portal;
     }
 
-    for (w = 0; w < num_wq; w++)
+    for (w = 0; w < num_wq; w++) {
+        if (posix_memalign((void **)&subs[w], 64,
+                           DSA_BATCH_DEPTH * g_max_batch * sizeof(*subs[w])) ||
+            posix_memalign((void **)&comps[w], 32,
+                           DSA_BATCH_DEPTH * g_max_batch * sizeof(*comps[w])) ||
+            posix_memalign((void **)&bcomps[w], 32, DSA_BATCH_DEPTH * sizeof(*bcomps[w]))) {
+            fprintf(stderr, "dsa_init: descriptor alloc failed\n");
+            goto rollback;
+        }
+    }
+
+    for (w = 0; w < num_wq; w++) {
         g_wq_portal[w] = portals[w];
+        g_subs[w] = subs[w];
+        g_comps[w] = comps[w];
+        g_bcomps[w] = bcomps[w];
+    }
     g_num_wq = num_wq;
 
     fprintf(stderr,
@@ -221,6 +283,9 @@ rollback:
     for (w = 0; w < num_wq; w++) {
         if (portals[w])
             munmap(portals[w], DSA_PORTAL_SIZE);
+        free(subs[w]);
+        free(comps[w]);
+        free(bcomps[w]);
     }
 out:
     pthread_mutex_unlock(&g_init_mutex);
@@ -303,11 +368,49 @@ int dsa_memcpy(void *dest, const void *src, size_t n) {
 #endif
 }
 
+/* Fills one batch of descriptors and hands it to the WQ without waiting. */
+static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
+                            struct dsa_completion_record *comp,
+                            struct dsa_completion_record *bcomp, void *const dest[],
+                            const void *const src[], const size_t n[], size_t first, size_t cnt) {
+    struct dsa_hw_desc bdesc;
+    size_t j;
+
+    memset(sub, 0, cnt * sizeof(*sub));
+    for (j = 0; j < cnt; j++) {
+        sub[j].opcode = DSA_OPCODE_MEMMOVE;
+
+        sub[j].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+        sub[j].completion_addr = (uint64_t)&comp[j];
+        sub[j].src_addr = (uint64_t)src[first + j];
+        sub[j].dst_addr = (uint64_t)dest[first + j];
+        sub[j].xfer_size = (uint32_t)n[first + j];
+        comp[j].status = 0;
+    }
+
+    bcomp->status = 0;
+
+    if (cnt == 1) {
+
+        sub[0].completion_addr = (uint64_t)bcomp;
+        __builtin_ia32_sfence();
+        return dsa_submit(&sub[0], portal);
+    }
+
+    memset(&bdesc, 0, sizeof(bdesc));
+    bdesc.opcode = DSA_OPCODE_BATCH;
+    bdesc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+    bdesc.desc_list_addr = (uint64_t)sub;
+    bdesc.desc_count = (uint32_t)cnt;
+    bdesc.completion_addr = (uint64_t)bcomp;
+
+    __builtin_ia32_sfence();
+    return dsa_submit(&bdesc, portal);
+}
+
 int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count) {
-    struct dsa_hw_desc *subs[DSA_MAX_WQ] = {NULL};
-    struct dsa_completion_record *comps[DSA_MAX_WQ] = {NULL};
-    size_t per_batch, i, nbatches, b, t, nthreads;
-    int ret = -1, ok = 1;
+    size_t per_batch, i, nbatches, nthreads;
+    int ok = 1;
 
     if (count == 0)
         return 0;
@@ -334,85 +437,56 @@ int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n
         }
     }
 
-    per_batch = g_max_batch ? g_max_batch : 1;
+    per_batch = g_max_batch;
     nbatches = (count + per_batch - 1) / per_batch;
 
-    for (t = 0; t < nthreads; t++) {
-        if (posix_memalign((void **)&subs[t], 64, per_batch * sizeof(*subs[t])) ||
-            posix_memalign((void **)&comps[t], 32, per_batch * sizeof(*comps[t]))) {
-            fprintf(stderr, "dsa_memcpy_batch: descriptor alloc failed\n");
-            goto out;
-        }
-    }
-
-#pragma omp parallel for num_threads(nthreads) schedule(dynamic) reduction(&& : ok)
-    for (b = 0; b < nbatches; b++) {
+#pragma omp parallel num_threads(nthreads) reduction(&& : ok)
+    {
         int tid = omp_get_thread_num();
         void *portal = g_wq_portal[tid];
-        struct dsa_hw_desc *sub = subs[tid];
-        struct dsa_completion_record *comp = comps[tid];
-        struct dsa_hw_desc bdesc;
-        struct dsa_completion_record bcomp __attribute__((aligned(32)));
-        size_t done = b * per_batch;
-        size_t cnt = count - done;
-        size_t j;
+        struct dsa_completion_record *bcomp = g_bcomps[tid];
+        size_t free_slots[DSA_BATCH_DEPTH], busy_slots[DSA_BATCH_DEPTH];
+        size_t next = (size_t)tid;
+        size_t nfree = DSA_BATCH_DEPTH, inflight = 0, k;
 
-        if (cnt > per_batch)
-            cnt = per_batch;
+        for (k = 0; k < DSA_BATCH_DEPTH; k++)
+            free_slots[k] = k;
 
-        memset(sub, 0, cnt * sizeof(*sub));
-        for (j = 0; j < cnt; j++) {
-            sub[j].opcode = DSA_OPCODE_MEMMOVE;
+        while (next < nbatches || inflight) {
+            while (nfree && next < nbatches) {
+                size_t slot = free_slots[nfree - 1];
+                size_t done = next * per_batch;
+                size_t cnt = count - done;
 
-            sub[j].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-            sub[j].completion_addr = (uint64_t)&comp[j];
-            sub[j].src_addr = (uint64_t)src[done + j];
-            sub[j].dst_addr = (uint64_t)dest[done + j];
-            sub[j].xfer_size = (uint32_t)n[done + j];
-            comp[j].status = 0;
-        }
+                if (cnt > per_batch)
+                    cnt = per_batch;
 
-        bcomp.status = 0;
-
-        if (cnt == 1) {
-
-            sub[0].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-            sub[0].completion_addr = (uint64_t)&bcomp;
-            __builtin_ia32_sfence();
-            if (dsa_submit(&sub[0], portal)) {
-                ok = 0;
-                continue;
+                if (dsa_submit_batch(portal, g_subs[tid] + slot * per_batch,
+                                     g_comps[tid] + slot * per_batch, &bcomp[slot], dest, src, n,
+                                     done, cnt)) {
+                    ok = 0;
+                    next = nbatches; /* drain what is in flight, submit no more */
+                    break;
+                }
+                nfree--;
+                busy_slots[inflight++] = slot;
+                next += nthreads;
             }
-        } else {
-            memset(&bdesc, 0, sizeof(bdesc));
-            bdesc.opcode = DSA_OPCODE_BATCH;
-            bdesc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-            bdesc.desc_list_addr = (uint64_t)sub;
-            bdesc.desc_count = (uint32_t)cnt;
-            bdesc.completion_addr = (uint64_t)&bcomp;
 
-            __builtin_ia32_sfence();
-            if (dsa_submit(&bdesc, portal)) {
+            if (!inflight)
+                break;
+
+            k = dsa_wait_any(bcomp, busy_slots, inflight);
+            if (bcomp[busy_slots[k]].status != DSA_COMP_SUCCESS) {
+                fprintf(stderr, "dsa batch failed, status=0x%x\n", bcomp[busy_slots[k]].status);
                 ok = 0;
-                continue;
             }
-        }
-
-        dsa_wait_completion(&bcomp.status);
-
-        if (bcomp.status != DSA_COMP_SUCCESS) {
-            fprintf(stderr, "dsa batch failed, status=0x%x\n", bcomp.status);
-            ok = 0;
+            free_slots[nfree++] = busy_slots[k];
+            busy_slots[k] = busy_slots[--inflight];
         }
     }
 
-    ret = ok ? 0 : -1;
-out:
-    for (t = 0; t < nthreads; t++) {
-        free(subs[t]);
-        free(comps[t]);
-    }
-    return ret;
+    return ok ? 0 : -1;
 }
 
 #ifdef DSA_MEMCPY_TEST

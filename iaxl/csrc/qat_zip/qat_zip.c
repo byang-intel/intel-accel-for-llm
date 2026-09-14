@@ -140,7 +140,7 @@ static void discover_all(void) {
     IAXL_CHECK(cpaDcGetInstances(total, handles) == CPA_STATUS_SUCCESS,
                "qat_zip: cpaDcGetInstances failed");
 
-    printf("[discovery] found %d QAT instance(s)\n", (int)total);
+    fprintf(stderr, "[discovery] found %d QAT instance(s)\n", (int)total);
     for (int i = 0; i < total; i++) {
         CpaInstanceInfo2 info = {0};
         IAXL_CHECK(cpaDcInstanceGetInfo2(handles[i], &info) == CPA_STATUS_SUCCESS,
@@ -167,8 +167,8 @@ static void discover_all(void) {
             g_dev_bus[d] = bus;
             g_dev_node[d] = info.nodeAffinity;
             g_dev_accel[d] = info.physInstId.acceleratorId;
-            printf("  device[%d]: PCIe bus=0x%02x  accel_id=%d  NUMA=%d\n", d, bus, g_dev_accel[d],
-                   g_dev_node[d]);
+            fprintf(stderr, "  device[%d]: PCIe bus=0x%02x  accel_id=%d  NUMA=%d\n", d, bus,
+                    g_dev_accel[d], g_dev_node[d]);
         }
     }
     free(handles);
@@ -271,8 +271,10 @@ int qat_zip_init(void) {
 
     const char *dev_sel = envs.IAXL_QAT_DEVICES();
 
-    printf("[config] instances/device=%d  src_cap=%u B  dst_cap=%u B  queue_depth=%d  devices=%s\n",
-           g_instances_per_device, g_src_cap, g_dst_cap, g_queue_depth, dev_sel);
+    fprintf(stderr,
+            "[config] instances/device=%d  src_cap=%u B  dst_cap=%u B  queue_depth=%d  "
+            "devices=%s\n",
+            g_instances_per_device, g_src_cap, g_dst_cap, g_queue_depth, dev_sel);
 
     qat_start();
     discover_all();
@@ -288,8 +290,9 @@ int qat_zip_init(void) {
                 continue;
             Instance *in = &g_inst[g_inst_count];
             instance_init(in, &g_all[k]);
-            printf("[select] instance[%d] on device[%d]: PCIe bus=0x%02x  accel_id=%d  NUMA=%d\n",
-                   g_inst_count, sel[s], in->pcie_bus, in->accel_id, in->node);
+            fprintf(stderr,
+                    "[select] instance[%d] on device[%d]: PCIe bus=0x%02x  accel_id=%d  NUMA=%d\n",
+                    g_inst_count, sel[s], in->pcie_bus, in->accel_id, in->node);
             g_inst_count++;
             got++;
         }
@@ -298,6 +301,7 @@ int qat_zip_init(void) {
                     sel[s], got, g_instances_per_device);
     }
     IAXL_CHECK(g_inst_count > 0, "qat_zip: no usable instance");
+    fprintf(stderr, "[qat_zip] init done: %d instance(s) on devices=%s\n", g_inst_count, dev_sel);
     return 0;
 }
 

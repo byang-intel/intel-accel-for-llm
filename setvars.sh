@@ -86,7 +86,7 @@ export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYE
 
 # ---- Intel QAT (compression accelerator) ------------------------------------
 export IAXL_QAT_DEVICES=${IAXL_QAT_DEVICES:-0}                                   # Comma-separated QAT device indices, e.g. "0,1"
-export IAXL_QAT_ZIP_INSTANCES_PER_DEVICE=${IAXL_QAT_ZIP_INSTANCES_PER_DEVICE:-4} # Instances (driving threads) per device
+export IAXL_QAT_ZIP_INSTANCES_PER_DEVICE=${IAXL_QAT_ZIP_INSTANCES_PER_DEVICE:-2} # Instances (driving threads) per device
 # QAT driving threads = number of devices x instances-per-device (override to force).
 case "${IAXL_QAT_ZIP_ENABLE,,}" in
     1|true|yes|on)

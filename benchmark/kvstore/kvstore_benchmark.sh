@@ -1,6 +1,13 @@
 #!/bin/bash -e
 
+export IAXL_QAT_ZIP_ENABLE=1
+export IAXL_IAA_ZIP_ENABLE=0
+export IAXL_CPU_ZIP_ENABLE=0
+export IAXL_DSA_GD_ENABLE=1
+export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../../setvars.sh"
 
 USE_DSA=0
 USE_NSYS=0

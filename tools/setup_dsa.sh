@@ -10,6 +10,8 @@ for s in /sys/bus/dsa/devices/dsa[0-9]*; do
     dev=$(basename "$s")
     [[ "$dev" =~ ^dsa[0-9]+$ ]] || continue
     DEVS+=("$dev")
+    node=$(cat "$s/numa_node" 2>/dev/null || echo -1)
+    echo "numa $node: $dev"
 done
 
 if [[ ${#DEVS[@]} -eq 0 ]]; then
@@ -24,6 +26,8 @@ for DEV in "${DEVS[@]}"; do
 
     TOTAL=$(cat "$SYS/max_work_queues_size")
     MAXWQ=$(cat "$SYS/max_work_queues")
+    MAXBATCH=$(cat "$SYS/max_batch_size")
+    MAXXFER=$(cat "$SYS/max_transfer_size")
     if ((NWQ > MAXWQ)); then
         echo "ERROR: $DEV supports only $MAXWQ WQs (requested $NWQ)" >&2
         exit 1
@@ -59,8 +63,8 @@ for DEV in "${DEVS[@]}"; do
             --type=user \
             --name=dsa_gpu \
             --priority=10 \
-            --max-transfer-size=2147483648 \
-            --max-batch-size=128 \
+            --max-transfer-size="$MAXXFER" \
+            --max-batch-size="$MAXBATCH" \
             --driver-name=user
     done
 

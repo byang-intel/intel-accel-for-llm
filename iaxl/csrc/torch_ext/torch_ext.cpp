@@ -50,6 +50,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("xfer_chunks_batch", &Context::xfer_chunks_batch, "Transfer batch of chunks (async)",
              py::arg("chunk_indices"), py::arg("cpu_tensors"),
              py::call_guard<py::gil_scoped_release>())
+        .def("xfer_chunks_batch_fast", &Context::xfer_chunks_batch_fast,
+             "Transfer batch of chunks (async).\n"
+             "Same as xfer_chunks_batch, but chunk_indices and cpu_ptrs are int64 CPU tensors,\n"
+             "cpu_ptrs holding the address of each chunk (keep the CPU tensors alive).",
+             py::arg("chunk_indices"), py::arg("cpu_ptrs"),
+             py::call_guard<py::gil_scoped_release>())
         .def("xfer_finish", &Context::xfer_finish, "Record GPU event after all transfers (async)",
              py::call_guard<py::gil_scoped_release>())
         .def("xfer_wait", &Context::xfer_wait, "Wait for raw transfers to complete",
