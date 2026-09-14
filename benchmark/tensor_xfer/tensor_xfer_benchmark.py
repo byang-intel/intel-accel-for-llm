@@ -32,9 +32,9 @@ from iaxl.utils.flamegraph import PerfRecorder
 DEFAULT_FRAG_SIZES = "1K,4K,8K,16K,32K,64K,128K,256K,512K,1M,2M"
 DEFAULT_OUTPUT_DIR = "/_data/tensor_xfer_benchmark"
 METHODS = {
-    "cuda": "CUDA copy_",
-    "batch": "cudaMemcpy3DBatchAsync",
-    "triton": "Triton kernel",
+    "cuda": "CUDA Copy",
+    "batch": "CUDA Copy Batch",
+    "triton": "CUDA Kernel",
     "iaxl": "IAXL DSA",
 }
 METHOD_COLORS = {

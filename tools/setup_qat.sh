@@ -29,9 +29,17 @@ fi
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
+SSL_NUM_PROCESSES=8
+echo "Setting [SSL] NumProcesses = $SSL_NUM_PROCESSES"
+
 for CONF in "${CONFS[@]}"; do
-    awk -v iommu="$IOMMU" '
+    awk -v iommu="$IOMMU" -v procs="$SSL_NUM_PROCESSES" '
+        /^[[:space:]]*\[/ { section = $0; gsub(/[][[:space:]]/, "", section) }
         /^[[:space:]]*(SVMEnabled|ATEnabled)[[:space:]]*=/ { next }
+        section == "SSL" && /^[[:space:]]*NumProcesses[[:space:]]*=/ {
+            print "NumProcesses = " procs
+            next
+        }
         { print }
         iommu == 1 && /^[[:space:]]*\[GENERAL\][[:space:]]*$/ {
             print "SVMEnabled = 1"
@@ -48,5 +56,16 @@ for CONF in "${CONFS[@]}"; do
     cat "$TMP" >"$CONF"
     echo "  $CONF: updated"
 done
+
+#adf_ctl down
+#modprobe -r qat_4xxx usdm_drv intel_qat
+#sleep 1
+#modprobe qat_4xxx
+#sleep 1
+#modprobe usdm_drv
+#sleep 1
+#adf_ctl up
+
+adf_ctl restart
 
 echo "Done. Run 'adf_ctl restart' (or 'systemctl restart qat') to apply."
