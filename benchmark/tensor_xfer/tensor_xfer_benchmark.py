@@ -29,7 +29,7 @@ from iaxl.tensor_ops import SliceCopier
 from iaxl.utils.flamegraph import PerfRecorder
 
 
-DEFAULT_FRAG_SIZES = "4K,16K,32K,64K,128K,256K,512K,1M,2M"
+DEFAULT_FRAG_SIZES = "1K,4K,8K,16K,32K,64K,128K,256K,512K,1M,2M"
 DEFAULT_OUTPUT_DIR = "/_data/tensor_xfer_benchmark"
 METHODS = {
     "cuda": "CUDA copy_",
@@ -38,9 +38,9 @@ METHODS = {
     "iaxl": "IAXL DSA",
 }
 METHOD_COLORS = {
-    "CUDA copy_": "#d62728",
-    "cudaMemcpy3DBatchAsync": "#ff7f0e",
-    "Triton kernel": "#2ca02c",
+    "CUDA Copy": "#d62728",
+    "CUDA Copy Batch": "#ff7f0e",
+    "CUDA Kernel": "#2ca02c",
     "IAXL DSA": "#1f77b4",
 }
 RECORDER: PerfRecorder | None = None
@@ -254,9 +254,9 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
                 cuda_timing=True,
                 warmup=args.warmup,
                 iterations=args.iterations,
-                label=label + ("CUDA copy_",),
+                label=label + ("CUDA Copy",),
             )
-            results.append(Result("CUDA copy_", direction, elapsed, total_bytes, valid()))
+            results.append(Result("CUDA Copy", direction, elapsed, total_bytes, valid()))
 
         if "batch" in args.methods:
             src_byte_offsets = [index * frag_bytes for index in src_indices]
@@ -287,7 +287,7 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
                     label=label + ("cudaMemcpy3DBatchAsync",),
                 )
             results.append(
-                Result("cudaMemcpy3DBatchAsync", direction, elapsed, total_bytes, valid())
+                Result("CUDA Copy Batch", direction, elapsed, total_bytes, valid())
             )
 
         if "triton" in args.methods:
@@ -312,9 +312,9 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
                 cuda_timing=True,
                 warmup=args.warmup,
                 iterations=args.iterations,
-                label=label + ("Triton kernel",),
+                label=label + ("CUDA Kernel",),
             )
-            results.append(Result("Triton kernel", direction, elapsed, total_bytes, valid()))
+            results.append(Result("CUDA Kernel", direction, elapsed, total_bytes, valid()))
 
         if "iaxl" in args.methods:
             if h2d:
@@ -369,7 +369,7 @@ def plot_results(
                     label=method,
                 )
 
-        axis.axvspan(4 << 10, 32 << 10, color="gold", alpha=0.15, label="KV 4K-32K")
+        axis.axvspan(4 << 10, 64 << 10, color="gold", alpha=0.15, label="KV <= 64K")
         axis.set_xscale("log", base=2)
         axis.set_xticks(frag_sizes)
         axis.set_xticklabels([format_size(size) for size in frag_sizes], rotation=45)
