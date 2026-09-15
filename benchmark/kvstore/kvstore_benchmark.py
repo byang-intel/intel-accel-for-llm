@@ -12,6 +12,7 @@ from typing import List, Tuple
 
 import torch
 
+from iaxl.utils.flamegraph import PerfRecorder
 from iaxl.utils.logger import setup_root_logger
 
 setup_root_logger(show_pid_tid=False)
@@ -38,6 +39,7 @@ DEFAULT_KV_CACHE_SHAPE = (2, 1024, 16, 4, 128)
 
 DEFAULT_METRICS_URL = "http://127.0.0.1:18800/v1/cache/metrics"
 DEFAULT_KV_DATA_DIR = "/_data/kvstore_benchmark"
+DEFAULT_OUTPUT_DIR = "/_data/kvstore_benchmark"
 DEFAULT_MODEL_SEQ_LEN = 16384
 SEED = 42
 BLOCK_DIM = 1
@@ -143,6 +145,35 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_METRICS_URL,
         help="KVStore REST endpoint for compression throughput metrics.",
     )
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        metavar="PATH",
+        help="Directory for the flame graph and perf data.",
+    )
+    parser.add_argument(
+        "--flamegraph",
+        nargs="?",
+        const="kvstore.svg",
+        default="",
+        metavar="PATH",
+        help="Record the measured PUT and GET phases (warm-up excluded) with perf "
+        "and write this flame graph SVG into --output-dir, together with .folded "
+        "and perf.data. PUT and GET samples are kept under separate root frames.",
+    )
+    parser.add_argument(
+        "--flamegraph-freq",
+        type=int,
+        default=999,
+        metavar="HZ",
+        help="perf sampling frequency.",
+    )
+    parser.add_argument(
+        "--flamegraph-call-graph",
+        choices=("fp", "dwarf", "lbr"),
+        default="fp",
+        help="perf call-graph unwinding mode.",
+    )
     add_env_arguments(parser)
     args = parser.parse_args()
     shape = tuple(args.kv_cache_shape)
@@ -166,6 +197,10 @@ def parse_args() -> argparse.Namespace:
             parser.error("--model-seq-len must be a positive multiple of TOKENS")
     args.kv_cache_shape = shape
     return args
+
+
+def output_path(directory: str, name: str) -> str:
+    return name if os.path.isabs(name) else os.path.join(directory, name)
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -511,7 +546,19 @@ def run_benchmark(args: argparse.Namespace) -> bool:
 
     cache_metrics_rest(args.metrics_url, "reset=1")
 
+    recorder = None
+    if args.flamegraph:
+        os.makedirs(args.output_dir, exist_ok=True)
+        recorder = PerfRecorder(
+            output_path(args.output_dir, "perf.data"),
+            frequency=args.flamegraph_freq,
+            call_graph=args.flamegraph_call_graph,
+        )
+
     torch.cuda.synchronize()
+    # Sampling starts after the warm-up so the flame graph only covers timed work.
+    if recorder is not None:
+        recorder.start(("PUT",))
     start = time.perf_counter()
     with torch.cuda.nvtx.range("benchmark PUT"):
         put_tasks = {}
@@ -527,11 +574,15 @@ def run_benchmark(args: argparse.Namespace) -> bool:
         if not kvstore.put_wait(put_tasks):
             raise RuntimeError("PUT did not complete")
     put_time = time.perf_counter() - start
+    if recorder is not None:
+        recorder.stop()
 
     for tensor in kv_caches.values():
         tensor.zero_()
     torch.cuda.synchronize()
 
+    if recorder is not None:
+        recorder.start(("GET",))
     start = time.perf_counter()
     with torch.cuda.nvtx.range("benchmark GET"):
         get_tasks = kvstore.get(
@@ -541,6 +592,8 @@ def run_benchmark(args: argparse.Namespace) -> bool:
             if not kvstore.get_wait(get_tasks, layer_names=[name]):
                 raise RuntimeError("GET did not complete")
     get_time = time.perf_counter() - start
+    if recorder is not None:
+        recorder.stop()
 
     verified = all(
         torch.equal(tensor.index_select(BLOCK_DIM, index), expected[name])
@@ -578,6 +631,15 @@ def run_benchmark(args: argparse.Namespace) -> bool:
         f"Decompress throughput: {metrics['decompress_gbps']:.3f} GB/s "
         f"({format_bytes(metrics['decompress_bytes'])} in {metrics['decompress_ns'] / 1e6:.1f} ms)"
     )
+
+    if recorder is not None:
+        svg = output_path(args.output_dir, args.flamegraph)
+        folded = f"{os.path.splitext(svg)[0]}.folded"
+        recorder.write_folded(folded)
+        recorder.write_svg(svg, title="kvstore PUT/GET")
+        print(f"\nFlame graph saved to {svg} ({recorder.samples} samples)")
+        print(f"Folded stacks saved to {folded}")
+        print(f"perf data kept at {recorder.data_path}")
     return verified
 
 

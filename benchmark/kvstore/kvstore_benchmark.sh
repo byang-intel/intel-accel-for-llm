@@ -1,7 +1,7 @@
 #!/bin/bash -e
 
 export IAXL_QAT_ZIP_ENABLE=1
-export IAXL_IAA_ZIP_ENABLE=0
+export IAXL_IAA_ZIP_ENABLE=1
 export IAXL_CPU_ZIP_ENABLE=0
 export IAXL_DSA_GD_ENABLE=1
 export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=0
@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/../../setvars.sh"
 
 USE_DSA=0
 USE_NSYS=0
+USE_FLAME=0
 PY_ARGS=()
 
 for arg in "$@"; do
@@ -21,11 +22,18 @@ for arg in "$@"; do
         --nsys)
             USE_NSYS=1
             ;;
+        --flame)
+            USE_FLAME=1
+            ;;
         *)
             PY_ARGS+=("$arg")
             ;;
     esac
 done
+
+if [[ "$USE_FLAME" == "1" ]]; then
+    PY_ARGS+=(--flamegraph kvstore.svg)
+fi
 
 export LD_PRELOAD="/usr/local/lib/libiomp5.so${LD_PRELOAD:+:$LD_PRELOAD}"
 
