@@ -124,12 +124,10 @@ target_link_directories(torch_ext PRIVATE "${PYTORCH_PATH}/lib" "${IAXL_LIB_DIR}
 find_package(ZLIB REQUIRED)
 target_link_libraries(torch_ext PRIVATE torch torch_python qat_s usdm_drv_s qpl ZLIB::ZLIB dl)
 
-# NIXL (remote_pool RDMA data plane, tools/install_nixl.sh): /usr/local/{include,lib}.
-# NO_DEFAULT_PATH: skip multiarch dirs so a stale /usr/local/lib/x86_64-linux-gnu copy is not picked.
 find_path(NIXL_INCLUDE_DIR nixl.h HINTS $ENV{NIXL_INCLUDE_DIR} PATHS /usr/local/include NO_DEFAULT_PATH)
-find_library(NIXL_LIBRARY nixl HINTS $ENV{NIXL_LIB_DIR} PATHS /usr/local/lib NO_DEFAULT_PATH)
+find_library(NIXL_LIBRARY nixl HINTS $ENV{NIXL_LIB_DIR} PATHS /usr/local/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
 if(NOT NIXL_INCLUDE_DIR OR NOT NIXL_LIBRARY)
-    message(FATAL_ERROR "NIXL not found; run tools/install_nixl.sh or set NIXL_INCLUDE_DIR / NIXL_LIB_DIR")
+    message(FATAL_ERROR "NIXL not found; set NIXL_INCLUDE_DIR / NIXL_LIB_DIR")
 endif()
 get_filename_component(NIXL_LIB_DIR "${NIXL_LIBRARY}" DIRECTORY)
 message(STATUS "NIXL: ${NIXL_INCLUDE_DIR} ${NIXL_LIBRARY}")
