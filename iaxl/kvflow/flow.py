@@ -20,6 +20,7 @@ from ..torch_ext import Context, GpuTransferDirection
 from ..torch_ext import Mem, Storage
 from .. import torch_ext as _iqt
 from .scratch_pool import ScratchPool
+from .remote_tensor import RemoteTensor
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ class KVFlow:
             return
 
         self.device_type = get_accelerator_device()
-        if self.device_type is None:
+        if self.device_type is None and not envs.IAXL_RDMA_ENABLE:
             raise RuntimeError(
                 "No accelerator available, KVFlow requires GPU support (CUDA or XPU)"
             )
@@ -119,6 +120,9 @@ class KVFlow:
     def _ensure_streams(self):
         if self._streams_initialized:
             return
+        if self.device_type is None:  # remote_pool daemon: no GPU, RDMA data plane
+            self._streams_initialized = True
+            return
         if self.device_type == "cuda":
             self.cur_stream = torch.cuda.current_stream()
             self.put_stream = torch.cuda.Stream()
@@ -136,7 +140,18 @@ class KVFlow:
 
     def _ensure_pool(self, block_shape: Tuple[int, ...], dtype: torch.dtype):
         if self.chunk_pool is None:
-            self.chunk_pool = ScratchPool(block_shape, dtype)
+            self.chunk_pool = ScratchPool(block_shape, dtype, pin_memory=self.device_type is not None)
+            if envs.IAXL_RDMA_ENABLE:
+                pool = self.chunk_pool.pool
+                _iqt.rdma_register_local(pool.data_ptr(), pool.nbytes, self.chunk_pool.block_bytes)
+
+    def _create_ctx(self, tensor, chunk_dim, direction, description, work_stream):
+        if isinstance(tensor, RemoteTensor):
+            return Context.create_remote(
+                tensor.base, tensor.dev_id, list(tensor.shape), tensor.element_size(),
+                chunk_dim, direction, description,
+            )
+        return Context.create(tensor, chunk_dim, direction, description, work_stream=work_stream)
 
     @profile_func(
         lambda self,
@@ -171,7 +186,7 @@ class KVFlow:
         first_t = next(iter(tensors.values()))
         assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
-            assert tensor.is_cuda or tensor.is_xpu, (
+            assert tensor.is_cuda or tensor.is_xpu or isinstance(tensor, RemoteTensor), (
                 f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
             )
             assert tensor.device == first_t.device, (
@@ -194,7 +209,7 @@ class KVFlow:
                 num_chunks, chunk_shape, tensor.dtype
             )
 
-            ctx = Context.create(
+            ctx = self._create_ctx(
                 tensor,
                 chunk_dim,
                 GpuTransferDirection.D2H,
@@ -202,7 +217,8 @@ class KVFlow:
                 work_stream=self.put_stream,
             )
             if first_tensor:
-                ctx.xfer_wait_cur_stream(sync_cur_stream=True)
+                if self.device_type is not None:
+                    ctx.xfer_wait_cur_stream(sync_cur_stream=True)
                 first_tensor = False
             ctx.xfer_chunks_batch(chunk_indices, cpu_tensors)
             ctx.xfer_finish()
@@ -281,7 +297,7 @@ class KVFlow:
         first_t = next(iter(tensors.values()))
         assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
-            assert tensor.is_cuda or tensor.is_xpu, (
+            assert tensor.is_cuda or tensor.is_xpu or isinstance(tensor, RemoteTensor), (
                 f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
             )
             assert tensor.device == first_t.device, (
@@ -304,7 +320,7 @@ class KVFlow:
                 num_chunks, chunk_shape, tensor.dtype
             )
 
-            ctx = Context.create(
+            ctx = self._create_ctx(
                 tensor,
                 chunk_dim,
                 GpuTransferDirection.H2D,
@@ -312,7 +328,7 @@ class KVFlow:
                 work_stream=self.get_stream,
             )
             if first_tensor:
-                if stream_sync_on_get:
+                if stream_sync_on_get and self.device_type is not None:
                     ctx.xfer_wait_cur_stream()
                 first_tensor = False
             ctx.unzip_from_mem(

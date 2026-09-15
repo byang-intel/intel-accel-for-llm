@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 from iaxl import KVStore, generate_block_hashs, setup_root_logger
+from iaxl.envs import envs as iaxl_envs
+from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
 from .async_load_config import load_async_load_layer_config_from_env
 
@@ -136,66 +138,32 @@ class KVShrinkConnector(KVConnectorBase_V1):
         )
 
         if role == KVConnectorRole.SCHEDULER:
-            self.kvstore: Optional[KVStore] = KVStore(
+            self.kvstore: Optional[KVStore] = self._kvstore_cls()(
                 model_name=os.path.basename(self.model_config.model),
                 layer_names=[str(index) for index in range(self.num_layers)],
                 tp_size=self.tp_size,
             )
         else:
             self.kvstore = None
-            self._bind_cpu_affinity()
-            self._bind_intel_accel()
+            if not iaxl_envs.IAXL_RDMA_ENABLE:  # compression/DSA run on the daemon node
+                self._bind_cpu_affinity()
+                self._bind_intel_accel()
+
+    @staticmethod
+    def _kvstore_cls():
+        if iaxl_envs.IAXL_RDMA_ENABLE:
+            from iaxl.remote_pool.kvstore_remote import KVStoreRemote
+
+            return KVStoreRemote
+        return KVStore
 
     def _bind_cpu_affinity(self) -> None:
         if self.vllm_device == "cpu":
             return
-
-        omp_bind = envs.VLLM_CPU_OMP_THREADS_BIND
-        if not omp_bind or omp_bind in ("all", "auto"):
-            raise ValueError(
-                "VLLM_CPU_OMP_THREADS_BIND must assign CPUs to each worker"
-            )
-
-        worker_cpu_specs = omp_bind.split("|")
-        if len(worker_cpu_specs) < self.tp_size:
-            raise ValueError(
-                f"VLLM_CPU_OMP_THREADS_BIND has {len(worker_cpu_specs)} entries, "
-                f"but tensor parallel size is {self.tp_size}"
-            )
-
-        cpu_ids: set[int] = set()
-        for part in worker_cpu_specs[self.rank].split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "-" in part:
-                start, end = map(int, part.split("-", maxsplit=1))
-                if start > end:
-                    raise ValueError(f"Invalid CPU range: {part}")
-                cpu_ids.update(range(start, end + 1))
-            else:
-                cpu_ids.add(int(part))
-
-        if not cpu_ids:
-            raise ValueError(f"No CPUs configured for rank {self.rank}")
-        os.sched_setaffinity(0, cpu_ids)
-        logger.info("Bound rank %d to CPUs %s", self.rank, sorted(cpu_ids))
+        bind_cpu_affinity(self.rank, self.tp_size, envs.VLLM_CPU_OMP_THREADS_BIND)
 
     def _bind_intel_accel(self) -> None:
-        for source, target in (
-            ("KVSHRINK_QAT_DEVICES", "IAXL_QAT_DEVICES"),
-            ("KVSHRINK_DSA_DEVICES", "IAXL_DSA_WQS"),
-        ):
-            spec = os.getenv(source)
-            if not spec:
-                continue
-            devices = spec.split("|")
-            if len(devices) <= self.rank:
-                raise ValueError(
-                    f"{source} has {len(devices)} entries, but rank is {self.rank}"
-                )
-            os.environ[target] = devices[self.rank]
-            logger.info("Bound rank %d: %s=%s", self.rank, target, devices[self.rank])
+        bind_intel_accel(self.rank)
 
     def _store(self) -> KVStore:
         if self.kvstore is None:
@@ -374,7 +342,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
         block_dim = 0 if self.use_mla or first_kv_cache.shape[1] == 2 else 1
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
-        self.kvstore = KVStore(
+        self.kvstore = self._kvstore_cls()(
             model_name=os.path.basename(self.model_config.model),
             block_dim=block_dim,
             kv_caches=kv_caches,

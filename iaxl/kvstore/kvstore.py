@@ -4,10 +4,11 @@
 import logging
 import torch
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional, Union
 import psutil
 from ..envs import envs
 from ..kvflow import KVFlow, Task, get_accelerator_device
+from ..kvflow.remote_tensor import RemoteTensor
 from ..utils.profiler import (
     profile_scope,
     profile_cross_scope,
@@ -32,7 +33,7 @@ class KVStore:
         self,
         model_name: str,
         block_dim: Optional[int] = None,
-        kv_caches: Optional[Dict[str, torch.Tensor]] = None,
+        kv_caches: Optional[Mapping[str, Union[torch.Tensor, RemoteTensor]]] = None,
         layer_names: Optional[List[str]] = None,
         rank: int = 0,
         tp_size: int = 1,

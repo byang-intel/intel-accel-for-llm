@@ -22,13 +22,13 @@ logger = logging.getLogger(__name__)
 
 
 class ScratchPool:
-    def __init__(self, block_shape: Sequence[int], dtype: torch.dtype):
+    def __init__(self, block_shape: Sequence[int], dtype: torch.dtype, pin_memory: bool = True):
         self.block_shape = tuple(block_shape)
         self.dtype = dtype
         self.block_bytes = math.prod(self.block_shape) * torch.tensor([], dtype=dtype).element_size()
         num_blocks = int(envs.IAXL_SCRATCH_POOL_SIZE_GB * 1024**3) // self.block_bytes
-        self.pool = torch.empty((num_blocks, *self.block_shape), dtype=dtype, device="cpu", pin_memory=True)
-        assert self.pool.is_pinned(), "ScratchPool: pin_memory=True did not take effect"
+        self.pool = torch.empty((num_blocks, *self.block_shape), dtype=dtype, device="cpu", pin_memory=pin_memory)
+        assert not pin_memory or self.pool.is_pinned(), "ScratchPool: pin_memory=True did not take effect"
         self._blocks: Tuple[torch.Tensor, ...] = self.pool.unbind(0)
         for i, t in enumerate(self._blocks):
             t.block_idx = i  # type: ignore[attr-defined]

@@ -65,6 +65,12 @@ class Envs:
         self.IAXL_API_CONTROLLER_PORT = _int("IAXL_API_CONTROLLER_PORT", 18700)
         self.IAXL_API_WORKER_BASE_PORT = _int("IAXL_API_WORKER_BASE_PORT", 18800)
 
+        self.IAXL_RDMA_ENABLE = _bool("IAXL_RDMA_ENABLE")
+        self.IAXL_RDMA_DAEMON_IP = _str("IAXL_RDMA_DAEMON_IP", "")
+        self.IAXL_RDMA_CLIENT_IP = _str("IAXL_RDMA_CLIENT_IP", "")
+        self.IAXL_RDMA_DAEMON_PORT = _int("IAXL_RDMA_DAEMON_PORT", 5555)
+        self.IAXL_RDMA_TP_SIZE = _int("IAXL_RDMA_TP_SIZE", 1)
+
         self.IAXL_PROFILE_MODE = _str("IAXL_PROFILE_MODE", "").strip().lower()
         self.IAXL_METRICS_ENABLED = _bool("IAXL_METRICS_ENABLED")
         self.IAXL_PERFETTO_ENABLED = _bool("IAXL_PERFETTO_ENABLED")

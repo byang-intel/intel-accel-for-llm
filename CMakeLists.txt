@@ -11,10 +11,10 @@ project(
 
 set(DEVICE
     "cuda"
-    CACHE STRING "Accelerator backend: cuda or xpu")
-set_property(CACHE DEVICE PROPERTY STRINGS cuda xpu)
-if(NOT DEVICE STREQUAL "cuda" AND NOT DEVICE STREQUAL "xpu")
-    message(FATAL_ERROR "Unsupported DEVICE=${DEVICE}; expected cuda or xpu")
+    CACHE STRING "Accelerator backend: cuda, xpu or rdma (remote_pool daemon)")
+set_property(CACHE DEVICE PROPERTY STRINGS cuda xpu rdma)
+if(NOT DEVICE MATCHES "^(cuda|xpu|rdma)$")
+    message(FATAL_ERROR "Unsupported DEVICE=${DEVICE}; expected cuda, xpu or rdma")
 endif()
 
 option(BUILD_CPU_BIND_SUPPORT "Enable CPU binding support" OFF)
@@ -81,6 +81,8 @@ if(DEVICE STREQUAL "cuda")
     list(APPEND IAXL_SRCS ${DSA_GD_SRCS})
     set_source_files_properties(${DSA_GD_SRCS} PROPERTIES COMPILE_OPTIONS
                                                           "-std=gnu11;-D_GNU_SOURCE")
+elseif(DEVICE STREQUAL "rdma")
+    list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/rdma.cpp")
 else()
     list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/xpu.cpp")
 endif()
@@ -143,6 +145,20 @@ if(DEVICE STREQUAL "cuda")
             message(WARNING "nvtx3/nvToolsExt.h not found; NVTX disabled")
         endif()
     endif()
+elseif(DEVICE STREQUAL "rdma")
+    # NIXL installed system-wide (tools/install_nixl.sh): /usr/local/{include,lib}
+    # NO_DEFAULT_PATH: skip multiarch dirs so a stale /usr/local/lib/x86_64-linux-gnu copy is not picked.
+    find_path(NIXL_INCLUDE_DIR nixl.h HINTS $ENV{NIXL_INCLUDE_DIR} PATHS /usr/local/include NO_DEFAULT_PATH)
+    find_library(NIXL_LIBRARY nixl HINTS $ENV{NIXL_LIB_DIR} PATHS /usr/local/lib NO_DEFAULT_PATH)
+    if(NOT NIXL_INCLUDE_DIR OR NOT NIXL_LIBRARY)
+        message(FATAL_ERROR "NIXL not found; run tools/install_nixl.sh or set NIXL_INCLUDE_DIR / NIXL_LIB_DIR")
+    endif()
+    get_filename_component(NIXL_LIB_DIR "${NIXL_LIBRARY}" DIRECTORY)
+    message(STATUS "NIXL: ${NIXL_INCLUDE_DIR} ${NIXL_LIBRARY}")
+    target_compile_definitions(torch_ext PRIVATE RDMA_SUPPORT=1)
+    target_include_directories(torch_ext PRIVATE "${NIXL_INCLUDE_DIR}")
+    target_link_libraries(torch_ext PRIVATE "${NIXL_LIBRARY}")
+    set(IAXL_EXTRA_RPATH ":${NIXL_LIB_DIR}")
 else()
     target_compile_definitions(torch_ext PRIVATE XPU_SUPPORT=1)
 endif()
@@ -168,5 +184,5 @@ endif()
 set_target_properties(
     torch_ext
     PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/iaxl"
-               BUILD_RPATH "${IAXL_LIB_DIR}"
-               INSTALL_RPATH "${IAXL_LIB_DIR}:$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib")
+               BUILD_RPATH "${IAXL_LIB_DIR}${IAXL_EXTRA_RPATH}"
+               INSTALL_RPATH "${IAXL_LIB_DIR}:$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib${IAXL_EXTRA_RPATH}")

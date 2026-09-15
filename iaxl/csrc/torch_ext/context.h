@@ -61,6 +61,31 @@ class Context {
         return ctx;
     }
 
+    // Remote (RDMA) tensor: only its address and contiguous geometry are known here.
+    static Context create_remote(uintptr_t base, int dev_id, const std::vector<int64_t> &shape,
+                                 int64_t elem_size, int chunk_dim,
+                                 GpuTransferDirection direction = GpuTransferDirection::H2D,
+                                 const std::string &name = "") {
+        Context ctx;
+        ctx.name_ = name;
+        ctx.direction_ = direction;
+        ctx.event_ = kv_xfer::event_acquire();
+        ctx.queue_ = &((direction == GpuTransferDirection::H2D) ? h2d_queue() : d2h_queue());
+
+        int64_t outer_dims = 1;
+        for (int d = 0; d < chunk_dim; d++)
+            outer_dims *= shape[d];
+        int64_t inner_size = elem_size;
+        for (size_t d = chunk_dim + 1; d < shape.size(); d++)
+            inner_size *= shape[d];
+        int64_t outer_block_size = shape[chunk_dim] * inner_size;
+
+        ctx.xctx_ = kv_xfer::context_create((char *)base, dev_id, inner_size, outer_dims,
+                                            inner_size, outer_block_size, nullptr);
+        PROFILE_SCOPE_FMT("ctx_create_remote(%s)", name.c_str());
+        return ctx;
+    }
+
     void xfer_chunk(const torch::Tensor &cpu_tensor, int64_t chunk_idx);
     void xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
                            const std::vector<torch::Tensor> &cpu_tensors);

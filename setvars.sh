@@ -137,6 +137,13 @@ export IAXL_API_WORKER_BASE_PORT=${IAXL_API_WORKER_BASE_PORT:-18800} # Worker se
 export IAXL_API_CONTROLLER_PORT=${IAXL_API_CONTROLLER_PORT:-18700}   # Controller server port
 export IAXL_API_TIMEOUT=${IAXL_API_TIMEOUT:-60}                      # HTTP request timeout in seconds
 
+# ---- Remote pool (KVStore daemon over RDMA/NIXL) ----------------------------
+export IAXL_RDMA_ENABLE=${IAXL_RDMA_ENABLE:-0}                # Use remote KVStore daemon instead of local KVStore (0/1)
+export IAXL_RDMA_DAEMON_IP=${IAXL_RDMA_DAEMON_IP:-}           # Daemon RDMA NIC IP (metadata + UCX device selection)
+export IAXL_RDMA_CLIENT_IP=${IAXL_RDMA_CLIENT_IP:-}           # Client RDMA NIC IP (UCX device selection)
+export IAXL_RDMA_DAEMON_PORT=${IAXL_RDMA_DAEMON_PORT:-5555}   # Scheduler port; rank r listens on port+1+r
+export IAXL_RDMA_TP_SIZE=${IAXL_RDMA_TP_SIZE:-$TP_SIZE}       # Daemon rank process count (must equal client TP)
+
 HOST_IP=$(ip route get 1 | awk '{print $7}' | tr -d '\n')
 export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,${HOST_IP}
 export http_proxy="${http_proxy:-}"

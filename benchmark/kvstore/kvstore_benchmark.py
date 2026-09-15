@@ -32,6 +32,7 @@ os.environ["IAXL_KV_LOSSY_TRUNC"] = str(_env_args.quant)
 os.environ["IAXL_KV_DATA_SHUFFLE"] = str(_env_args.data_shuffle)
 
 from iaxl.kvstore import KVStore, get_accelerator_device
+from iaxl.envs import envs as iaxl_envs
 
 DEFAULT_KV_CACHE_SHAPE = (2, 1024, 16, 4, 128)
 
@@ -491,7 +492,13 @@ def run_benchmark(args: argparse.Namespace) -> bool:
 
     block_hashes = make_block_hashes(num_blocks)
 
-    kvstore = KVStore(
+    if iaxl_envs.IAXL_RDMA_ENABLE:
+        from iaxl.remote_pool.kvstore_remote import KVStoreRemote
+
+        kvstore_cls = KVStoreRemote
+    else:
+        kvstore_cls = KVStore
+    kvstore = kvstore_cls(
         model_name="kvstore_benchmark",
         kv_caches=kv_caches,
         block_dim=BLOCK_DIM,

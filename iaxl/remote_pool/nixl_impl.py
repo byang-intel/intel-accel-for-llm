@@ -1,33 +1,38 @@
 """NIXL wrapper. `rdma_xfer` owns one NIXL agent (UCX backend pinned to the RDMA
-NIC) and exposes memory registration, peer metadata exchange, notifications and
-prepped block transfers. It knows nothing about KV caches or RPC (see rpc.py)."""
+NIC that owns `local_ip`) and exposes memory registration, peer metadata
+exchange, notifications and one-shot RDMA writes. It knows nothing about KV
+caches or RPC (see rpc.py). `rdma_xfer_cpp` offers the same surface on top of
+the C++ agent embedded in `iaxl.torch_ext` (daemon rank processes)."""
 
-import math
+import json
 import os
+import subprocess
 import time
 
-RDMA_NIC = "ens34f0np0"
 DEFAULT_PORT = 5555
 LOCAL_AGENT = "NIXL_INIT_AGENT"
 
 
-def configure_ucx_env(nic: str = RDMA_NIC) -> str:
-    """Force UCX onto the RDMA NIC. Must run before `import nixl`."""
-    ibdev = sorted(os.listdir(f"/sys/class/net/{nic}/device/infiniband"))[0]
+def netdev_of_ip(ip: str) -> str:
+    out = subprocess.check_output(["ip", "-j", "-4", "addr"], text=True)
+    for link in json.loads(out):
+        if any(a.get("local") == ip for a in link.get("addr_info", [])):
+            return link["ifname"]
+    raise RuntimeError(f"no network interface owns {ip}")
+
+
+def configure_ucx_env(local_ip: str | None) -> str | None:
+    """Force UCX onto the RDMA NIC owning `local_ip`. Must run before `import nixl`."""
+    if not local_ip:
+        return None
+    nic = netdev_of_ip(local_ip)
+    ib_dir = f"/sys/class/net/{nic}/device/infiniband"
+    if not os.path.isdir(ib_dir):
+        raise RuntimeError(f"{nic} ({local_ip}) is not an RDMA-capable NIC")
+    ibdev = sorted(os.listdir(ib_dir))[0]
     os.environ.setdefault("UCX_NET_DEVICES", f"{ibdev}:1")
     os.environ.setdefault("UCX_TLS", "rc,cuda_copy,cuda_ipc")
     return ibdev
-
-
-def block_descs(base: int, shape, elem_size: int, dev_id: int):
-    """One (addr, len, dev_id) per (kv, block); desc index = kv * num_blocks + block."""
-    kv_count, num_blocks = shape[0], shape[1]
-    blk = math.prod(shape[2:]) * elem_size
-    return [(base + i * blk, blk, dev_id) for i in range(kv_count * num_blocks)], blk
-
-
-def desc_indices(num_blocks: int, blocks):
-    return [kv * num_blocks + b for kv in (0, 1) for b in blocks]
 
 
 def _s(x):
@@ -35,21 +40,24 @@ def _s(x):
 
 
 class rdma_xfer:
-    """One NIXL agent. `listen_port` enables the metadata listener so peers can
-    connect to us; None gives a connect-only agent."""
+    """One NIXL agent (Python bindings). `listen_port` is the metadata listener
+    port; None lets the OS pick one (connect-only agent)."""
 
-    def __init__(self, name: str, listen_port: int | None = None, nic: str = RDMA_NIC):
-        self.ibdev = configure_ucx_env(nic)  # must precede `import nixl`
+    def __init__(self, name: str, listen_port: int | None = None, local_ip: str | None = None):
+        self.ibdev = configure_ucx_env(local_ip)  # must precede `import nixl`
         from nixl._api import nixl_agent, nixl_agent_config
 
+        # The listen (comm) thread also drives fetch_remote_metadata /
+        # send_local_metadata; without it those calls are silently dropped.
         cfg = nixl_agent_config(
             enable_prog_thread=True,
-            enable_listen_thread=listen_port is not None,
+            enable_listen_thread=True,
             backends=["UCX"],
             listen_port=listen_port or 0,
         )
         self.name = name
         self.agent = nixl_agent(name, cfg)
+        self._handles = []
 
     # -- peers ---------------------------------------------------------------
     def connect(self, peer: str, ip: str, port: int, timeout_s: float | None = None):
@@ -71,40 +79,37 @@ class rdma_xfer:
 
     # -- memory --------------------------------------------------------------
     def register_memory(self, tensor):
-        return self.agent.register_memory(tensor)
+        h = self.agent.register_memory(tensor)
+        self._handles.append(h)
+        return h
 
     def deregister_memory(self, handle):
         self.agent.deregister_memory(handle)
 
-    # -- descriptor lists ----------------------------------------------------
-    def prep_dlist(self, descs, mem_type: str, peer: str | None = None):
-        """mem_type "DRAM" | "VRAM"; peer None means our own (local) side."""
-        return self.agent.prep_xfer_dlist(peer or LOCAL_AGENT, descs, mem_type)
-
-    def release_dlist(self, handle):
-        self.agent.release_dlist_handle(handle)
-
     # -- transfers -----------------------------------------------------------
-    def start_xfer(self, op: str, local_h, local_idx, remote_h, remote_idx):
-        """op "READ" (remote -> local) | "WRITE" (local -> remote). Returns the xfer handle."""
-        h = self.agent.make_prepped_xfer(op, local_h, local_idx, remote_h, remote_idx)
-        self.agent.transfer(h)
-        return h
-
-    def xfer_state(self, handle) -> str:
-        return self.agent.check_xfer_state(handle)
-
-    def wait_xfer(self, handle, timeout_s: float = 60.0):
-        t0 = time.perf_counter()
-        while (state := self.agent.check_xfer_state(handle)) != "DONE":
-            if state == "ERR":
-                raise RuntimeError("NIXL transfer failed")
-            if time.perf_counter() - t0 > timeout_s:
-                raise TimeoutError("NIXL transfer timed out")
-            time.sleep(1e-5)
-
-    def release_xfer(self, handle):
-        self.agent.release_xfer_handle(handle)
+    def write(self, peer: str, local_addr: int, remote_addr: int, nbytes: int, notif: bytes = b"",
+              timeout_s: float = 60.0):
+        """RDMA WRITE `nbytes` from a registered local DRAM buffer into the peer's
+        registered DRAM buffer, delivering `notif` once the data has landed."""
+        a = self.agent
+        h = a.initialize_xfer(
+            "WRITE",
+            a.get_xfer_descs([(local_addr, nbytes, 0)], "DRAM"),
+            a.get_xfer_descs([(remote_addr, nbytes, 0)], "DRAM"),
+            peer,
+            notif,
+        )
+        try:
+            state = a.transfer(h)
+            t0 = time.perf_counter()
+            while state != "DONE":
+                if state == "ERR":
+                    raise RuntimeError("NIXL write failed")
+                if time.perf_counter() - t0 > timeout_s:
+                    raise TimeoutError("NIXL write timed out")
+                state = a.check_xfer_state(h)
+        finally:
+            a.release_xfer_handle(h)
 
     # -- notifications -------------------------------------------------------
     def send_notif(self, peer: str, payload: bytes):
@@ -115,3 +120,31 @@ class rdma_xfer:
         for peer, msgs in self.agent.get_new_notifs().items():
             for m in msgs:
                 yield _s(peer), m
+
+
+class rdma_xfer_cpp:
+    """Notification/registration surface over the agent owned by iaxl.torch_ext
+    (DEVICE=rdma build). The data plane runs inside the extension."""
+
+    def __init__(self, name: str, listen_port: int):
+        from iaxl import torch_ext
+
+        self.name = name
+        self._ext = torch_ext
+        torch_ext.rdma_init(name, listen_port)
+
+    def wait_peer(self, peer: str, timeout_s: float | None = None):
+        self._ext.rdma_wait_peer(peer, timeout_s if timeout_s is not None else 3600.0)
+
+    def disconnect(self, peer: str):
+        self._ext.rdma_remove_peer(peer)
+
+    def register_memory(self, tensor):
+        self._ext.rdma_register_mem(tensor.data_ptr(), tensor.numel() * tensor.element_size())
+        return tensor
+
+    def send_notif(self, peer: str, payload: bytes):
+        self._ext.rdma_send_notif(peer, payload)
+
+    def iter_notifs(self):
+        yield from self._ext.rdma_get_notifs()
