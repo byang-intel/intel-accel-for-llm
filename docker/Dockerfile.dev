@@ -23,3 +23,14 @@ COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
+RUN git clone https://github.com/ai-dynamo/nixl.git /opt/nixl && \
+    cd /opt/nixl && \
+    git checkout v1.2.0 \
+    meson setup build \
+        -Ducx_path=/usr/local/ucx \
+        -Dinstall_headers=true \
+        -Denable_plugins=UCX \
+        -Ddisable_gds_backend=true \
+        -Dbuild_docs=false \
+        --prefix=/usr/local && \
+    cd build && ninja && ninja install && ldconfig
