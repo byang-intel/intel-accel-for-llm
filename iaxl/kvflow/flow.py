@@ -96,7 +96,7 @@ class KVFlow:
 
         self.cache_size_bytes = int(cache_size_gb * 1024**3)
 
-        self.chunk_pool = ScratchPool(cache_size_gb=cache_size_gb)
+        self.chunk_pool: Optional[ScratchPool] = None  # created on first put/get, once block shape is known
 
         self.mem = Mem(
             capacity_bytes=self.cache_size_bytes,
@@ -133,6 +133,10 @@ class KVFlow:
             self.get_stream_ctx = lambda: torch.xpu.stream(self.get_stream)
         self._streams_initialized = True
         logger.info("CUDA/XPU streams created (lazy init, device=%s)", self.device_type)
+
+    def _ensure_pool(self, block_shape: Tuple[int, ...], dtype: torch.dtype):
+        if self.chunk_pool is None:
+            self.chunk_pool = ScratchPool(block_shape, dtype)
 
     @profile_func(
         lambda self,
@@ -183,6 +187,7 @@ class KVFlow:
         chunk_shape = list(first_t.shape)
         del chunk_shape[chunk_dim]
         chunk_shape = tuple(chunk_shape)
+        self._ensure_pool(chunk_shape, first_t.dtype)
 
         for tensor_index, (tensor_key, tensor) in enumerate(tensors.items()):
             cpu_tensors = self.chunk_pool.allocate(
@@ -291,6 +296,7 @@ class KVFlow:
         chunk_shape = list(first_t.shape)
         del chunk_shape[chunk_dim]
         chunk_shape = tuple(chunk_shape)
+        self._ensure_pool(chunk_shape, first_t.dtype)
 
         first_tensor = True
         for tensor_key, tensor in tensors.items():
@@ -404,22 +410,22 @@ class KVFlow:
         unpersisted = self.mem.unpersisted_count
         group_count = self.mem.group_count
 
-        with self.chunk_pool._lock:
-            pool_total_tensors = self.chunk_pool._total_tensors
-            pool_total_bytes = self.chunk_pool._total_bytes
-            pool_available = sum(len(p) for p in self.chunk_pool._pools.values())
-            pool_in_use = (
-                self.chunk_pool._allocate_count - self.chunk_pool._release_count
-            )
+        pool = self.chunk_pool
+        if pool is None:
+            pool_total_tensors = pool_total_bytes = pool_available = pool_in_use = 0
             pool_shapes = []
-            for (shape, dtype), tensors in self.chunk_pool._pools.items():
-                pool_shapes.append(
-                    {
-                        "shape": list(shape),
-                        "dtype": str(dtype),
-                        "available": len(tensors),
-                    }
-                )
+        else:
+            pool_total_tensors = pool.num_blocks
+            pool_total_bytes = pool.total_bytes()
+            pool_available = pool.available_count()
+            pool_in_use = pool_total_tensors - pool_available
+            pool_shapes = [
+                {
+                    "shape": list(pool.block_shape),
+                    "dtype": str(pool.dtype),
+                    "available": pool_available,
+                }
+            ]
 
         return {
             "has_only_mode": False,
