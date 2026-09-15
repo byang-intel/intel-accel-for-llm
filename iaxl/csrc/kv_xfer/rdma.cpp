@@ -1,8 +1,9 @@
 // Copyright (C) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-// kv_xfer backend for the remote_pool daemon: the "GPU" is a client's VRAM
-// reached over RDMA through NIXL. put = RDMA READ (d2h), get = RDMA WRITE (h2d).
+// RDMA flavour of kv_xfer::Ops for the remote_pool daemon (always compiled, used
+// when IAXL_RDMA_ENABLE selects Context::create_remote): the "GPU" is a client's
+// VRAM reached over RDMA through NIXL. put = RDMA READ (d2h), get = RDMA WRITE (h2d).
 // Transfers are posted and polled synchronously on the TaskQueue worker, so
 // copy_chunks_batch returning means the data has landed; events are plain flags.
 
@@ -207,41 +208,17 @@ std::vector<std::pair<std::string, std::string>> rdma_get_notifs() {
     return out;
 }
 
-// ---- kv_xfer.h ---------------------------------------------------------------
+// ---- kv_xfer::Ops (RDMA flavour) ---------------------------------------------
+
+namespace rdma {
 
 event_t event_acquire() { return new std::atomic<bool>(false); }
 void event_release(event_t event) { delete as_ev(event); }
-event_t event_create() { return event_acquire(); }
-void event_destroy(event_t event) { event_release(event); }
 
 void event_synchronize(event_t event) {
     auto *f = as_ev(event);
     while (!f->load(std::memory_order_acquire))
         std::this_thread::yield();
-}
-
-stream_t extract_stream(pybind11::object) { return nullptr; }
-event_t wait_stream_from_py(pybind11::object) { return nullptr; }
-
-context_t context_create(char *gpu_base_ptr, int /*device_index*/, int64_t chunk_stride, int64_t outer_dims,
-                         int64_t inner_size, int64_t outer_block_size, stream_t /*work_stream*/) {
-    Rdma &r = Rdma::get();
-    XferContext *x = new XferContext();
-    {
-        std::lock_guard<std::mutex> lock(r.mu);
-        auto it = r.remotes.find(reinterpret_cast<uintptr_t>(gpu_base_ptr));
-        IAXL_CHECK(it != r.remotes.end(), "context_create: tensor not registered with rdma_register_remote");
-        x->reg = &it->second; // unordered_map nodes are address-stable until erased
-    }
-    IAXL_CHECK(x->reg->chunk_stride == chunk_stride && x->reg->outer_dims == outer_dims &&
-                   x->reg->inner_size == inner_size && x->reg->outer_block_size == outer_block_size,
-               "context_create: geometry differs from rdma_register_remote");
-    x->chunk_stride = chunk_stride;
-    x->outer_dims = outer_dims;
-    x->inner_size = inner_size;
-    x->outer_block_size = outer_block_size;
-    ensure_pool_dlist(r, outer_dims, inner_size);
-    return x;
 }
 
 void context_destroy(context_t ctx) { delete as_ctx(ctx); }
@@ -292,6 +269,38 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
 
 void copy_chunk(context_t ctx, char *cpu_base, int64_t chunk_index, bool h2d) {
     copy_chunks_batch(ctx, {chunk_index}, {cpu_base}, h2d);
+}
+
+} // namespace rdma
+
+const Ops &rdma_ops() {
+    static const Ops ops{rdma::event_acquire,         rdma::event_release,          rdma::event_synchronize,
+                         rdma::context_destroy,       rdma::context_stream_id,      rdma::context_same_stream,
+                         rdma::copy_chunk,            rdma::copy_chunks_batch,      rdma::context_record_event,
+                         rdma::context_work_wait_event, rdma::context_cur_wait_event, rdma::context_work_wait_cur,
+                         rdma::context_sync_cur};
+    return ops;
+}
+
+context_t rdma_context_create(char *gpu_base_ptr, int64_t chunk_stride, int64_t outer_dims, int64_t inner_size,
+                              int64_t outer_block_size) {
+    Rdma &r = Rdma::get();
+    XferContext *x = new XferContext();
+    {
+        std::lock_guard<std::mutex> lock(r.mu);
+        auto it = r.remotes.find(reinterpret_cast<uintptr_t>(gpu_base_ptr));
+        IAXL_CHECK(it != r.remotes.end(), "rdma_context_create: tensor not registered with rdma_register_remote");
+        x->reg = &it->second; // unordered_map nodes are address-stable until erased
+    }
+    IAXL_CHECK(x->reg->chunk_stride == chunk_stride && x->reg->outer_dims == outer_dims &&
+                   x->reg->inner_size == inner_size && x->reg->outer_block_size == outer_block_size,
+               "rdma_context_create: geometry differs from rdma_register_remote");
+    x->chunk_stride = chunk_stride;
+    x->outer_dims = outer_dims;
+    x->inner_size = inner_size;
+    x->outer_block_size = outer_block_size;
+    ensure_pool_dlist(r, outer_dims, inner_size);
+    return x;
 }
 
 } // namespace kv_xfer

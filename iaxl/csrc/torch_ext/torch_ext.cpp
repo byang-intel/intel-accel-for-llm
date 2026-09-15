@@ -7,9 +7,7 @@
 
 #include "context.h"
 #include "kv_pool.h"
-#ifdef RDMA_SUPPORT
 #include "kv_xfer_rdma.h"
-#endif
 
 using namespace profiler;
 
@@ -38,13 +36,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("tensor"), py::arg("chunk_dim"),
             py::arg("direction") = GpuTransferDirection::H2D, py::arg("name") = "gpu_xfer",
             py::arg("work_stream") = py::none())
-#ifdef RDMA_SUPPORT
         .def_static("create_remote", &Context::create_remote,
                     "Create transfer context for a client tensor registered via rdma_register_remote.",
                     py::arg("base"), py::arg("dev_id"), py::arg("shape"), py::arg("elem_size"),
                     py::arg("chunk_dim"), py::arg("direction") = GpuTransferDirection::H2D,
                     py::arg("name") = "rdma_xfer")
-#endif
         .def("xfer_wait_cur_stream", &Context::xfer_wait_cur_stream,
              "Make work_stream wait for cur_stream's pending work (GPU-side, async).\n"
              "sync_cur_stream: if True, additionally CPU-blocking wait until cur_stream's\n"
@@ -508,7 +504,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         },
         "Read accumulated compression/decompression throughput metrics (GB/s is decimal)");
 
-#ifdef RDMA_SUPPORT
     m.def("rdma_init", &kv_xfer::rdma_init, py::arg("name"), py::arg("listen_port"),
           py::call_guard<py::gil_scoped_release>());
     m.def("rdma_wait_peer", &kv_xfer::rdma_wait_peer, py::arg("peer"), py::arg("timeout_s") = 60.0,
@@ -543,5 +538,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             out.append(py::make_tuple(peer, py::bytes(msg)));
         return out;
     });
-#endif
 }

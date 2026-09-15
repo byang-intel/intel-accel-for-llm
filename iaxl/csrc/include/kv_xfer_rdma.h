@@ -1,8 +1,8 @@
 // Copyright (C) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-// Daemon-side RDMA backend control API (DEVICE=rdma). One nixlAgent per process;
-// the data plane (kv_xfer.h) reads/writes the client's GPU memory through it.
+// Daemon-side RDMA backend (always compiled, enabled via IAXL_RDMA_ENABLE). One
+// nixlAgent per process; the data plane reads/writes the client's GPU memory through it.
 
 #pragma once
 
@@ -12,7 +12,14 @@
 #include <utility>
 #include <vector>
 
+#include "kv_xfer.h"
+
 namespace kv_xfer {
+
+// Data-plane entry points used by Context::create_remote.
+const Ops &rdma_ops();
+context_t rdma_context_create(char *gpu_base_ptr, int64_t chunk_stride, int64_t outer_dims,
+                              int64_t inner_size, int64_t outer_block_size);
 
 void rdma_init(const std::string &name, int listen_port);
 void rdma_wait_peer(const std::string &peer, double timeout_s);

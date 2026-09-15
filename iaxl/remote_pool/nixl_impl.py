@@ -124,7 +124,7 @@ class rdma_xfer:
 
 class rdma_xfer_cpp:
     """Notification/registration surface over the agent owned by iaxl.torch_ext
-    (DEVICE=rdma build). The data plane runs inside the extension."""
+    (always built in). The data plane runs inside the extension."""
 
     def __init__(self, name: str, listen_port: int):
         from iaxl import torch_ext

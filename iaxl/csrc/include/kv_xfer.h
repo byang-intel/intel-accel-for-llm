@@ -43,6 +43,34 @@ void context_cur_wait_event(context_t ctx, event_t event);
 void context_work_wait_cur(context_t ctx);
 void context_sync_cur(context_t ctx);
 
+// Per-context backend: the GPU (cuda/xpu) free functions above, or the RDMA
+// backend in rdma.cpp (kv_xfer_rdma.h). Selected when a Context is created.
+struct Ops {
+    event_t (*event_acquire)();
+    void (*event_release)(event_t);
+    void (*event_synchronize)(event_t);
+    void (*context_destroy)(context_t);
+    unsigned long long (*context_stream_id)(context_t);
+    bool (*context_same_stream)(context_t);
+    void (*copy_chunk)(context_t, char *, int64_t, bool);
+    void (*copy_chunks_batch)(context_t, const std::vector<int64_t> &, const std::vector<char *> &,
+                              bool);
+    void (*context_record_event)(context_t, event_t);
+    void (*context_work_wait_event)(context_t, event_t);
+    void (*context_cur_wait_event)(context_t, event_t);
+    void (*context_work_wait_cur)(context_t);
+    void (*context_sync_cur)(context_t);
+};
+
+inline const Ops &gpu_ops() {
+    static const Ops ops{event_acquire,         event_release,          event_synchronize,
+                         context_destroy,       context_stream_id,      context_same_stream,
+                         copy_chunk,            copy_chunks_batch,      context_record_event,
+                         context_work_wait_event, context_cur_wait_event, context_work_wait_cur,
+                         context_sync_cur};
+    return ops;
+}
+
 #if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
 
 void dsa_context_reset();

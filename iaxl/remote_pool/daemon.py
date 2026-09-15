@@ -6,7 +6,7 @@
 process per TP rank (KVStore with RDMA data plane, listening on port+1+rank) plus
 one scheduler process (has-only KVStore, listening on `port`).
 
-Requires `iaxl.torch_ext` built with DEVICE=rdma and IAXL_RDMA_ENABLE=1.
+Requires IAXL_RDMA_ENABLE=1 (the RDMA backend is always built into `iaxl.torch_ext`).
 
 Run:  python3 -m iaxl.remote_pool.daemon [--ip IP] [--port PORT] [--tp-size N]
 """

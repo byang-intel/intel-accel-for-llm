@@ -33,7 +33,7 @@ flowchart LR
 | # | 决策 | 理由 |
 |---|------|------|
 | 1 | daemon 发起 RDMA，client 被动 | client 只需注册显存 + RPC，无 GPU 拷贝流、无 scratch pool；数据面全部在 daemon 的 worker 线程里跑，天然脱离 Python 主线程 |
-| 2 | `kv_xfer/rdma.cpp` 作为一个新的 **device backend**（`DEVICE=rdma`），完整实现 `kv_xfer.h` | `Context`、`TaskQueue`、`xfer.cpp`、`flow.py` 的调用链不变；daemon 无 GPU，`cuda.cpp` 不参与编译；client 仍用 `DEVICE=cuda` 构建，零改动 |
+| 2 | `kv_xfer/rdma.cpp` 实现 RDMA 版 `kv_xfer::Ops`（函数表），与 `cuda.cpp`/`xpu.cpp` **无条件一起编译**；`Context::create_remote` 选 `rdma_ops()`，`Context::create` 选 `gpu_ops()` | `TaskQueue`、`xfer.cpp`、`flow.py` 的调用链不变；同一个 `torch_ext.so` 同时服务 client（CUDA）和 daemon（RDMA），运行时由 `IAXL_RDMA_ENABLE` 决定用哪条路径 |
 | 3 | daemon 侧 `nixlAgent` 由 C++ 持有（单例），通过 pybind 暴露注册 / 通知接口给 Python | 数据面（post/poll）与 pool 注册必须在同一个 agent 上；RPC 通知也复用该 agent，一个进程一个 agent |
 | 4 | client 侧继续用 Python `nixl_impl.rdma_xfer` | client 只做注册和 RPC，Python 性能足够；无需在 vLLM 进程里引入新 C++ 依赖 |
 | 5 | RDMA 完成用 worker 线程同步 post + poll（同 `dsa.cpp`） | `copy_chunks_batch` 返回即数据落地，`xfer_finish` / `event_synchronize` 语义不变 |
@@ -189,7 +189,7 @@ class RemoteTensor:
 
 ### 3.6 daemon：`iaxl/csrc/kv_xfer/rdma.cpp`（新增，实现 `kv_xfer.h`）
 
-CMake：`if(DEVICE STREQUAL "rdma")` → 编译 `rdma.cpp`，定义 `RDMA_SUPPORT`，链接 `nixl`（`find_library(NIXL nixl)` + `include/nixl.h`），不链接 CUDA。
+CMake：`rdma.cpp` 始终编译，始终链接 `nixl`（`/usr/local/{include,lib}`，可用 `NIXL_INCLUDE_DIR`/`NIXL_LIB_DIR` 覆盖）；不再有 `DEVICE=rdma` / `RDMA_SUPPORT`。
 
 ```cpp
 // ---- kv_xfer.h 现有接口，语义映射 ----
