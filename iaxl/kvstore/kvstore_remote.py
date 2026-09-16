@@ -13,9 +13,9 @@ from typing import Dict, List, Optional
 import torch
 
 from ..envs import envs
-from . import rpc
-from .nixl_impl import rdma_xfer
-from .rpc import RpcChannel, rank_port
+from ..remote_pool import rpc
+from ..remote_pool.nixl_impl import rdma_xfer
+from ..remote_pool.rpc import RpcChannel, rank_port
 
 logger = logging.getLogger(__name__)
 

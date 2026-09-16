@@ -46,7 +46,7 @@ flowchart LR
 
 ## 3. 各组件
 
-### 3.1 client：`iaxl/remote_pool/kvstore_remote.py`
+### 3.1 client：`iaxl/kvstore/kvstore_remote.py`
 
 ```python
 class KVStoreRemote:
@@ -439,7 +439,7 @@ sequenceDiagram
 
 | 文件 | 内容 |
 |------|------|
-| `iaxl/remote_pool/kvstore_remote.py` | `KVStoreRemote`（§3.1 全部方法，含 `_drain()`、`_done`；`put()` 前 `current_stream().synchronize()`）、`RemoteTask` |
+| `iaxl/kvstore/kvstore_remote.py` | `KVStoreRemote`（§3.1 全部方法，含 `_drain()`、`_done`；`put()` 前 `current_stream().synchronize()`）、`RemoteTask` |
 | `iaxl/kvflow/remote_tensor.py` | `RemoteTensor(peer, base, shape, dtype, dev_id)` |
 | `iaxl/csrc/kv_xfer/rdma.cpp` | `kv_xfer.h` 全部接口的 RDMA 实现 + `rdma_copy_chunks_batch(remote_base, chunk_stride, outer_dims, inner_size, outer_block_size, h2d, chunk_indices, cpu_ptrs)` |
 | `iaxl/csrc/include/kv_xfer_rdma.h` | `rdma_init / rdma_add_peer / rdma_remove_peer / rdma_register_local / rdma_register_remote / rdma_unregister_remote / rdma_send_notif / rdma_get_notifs` |

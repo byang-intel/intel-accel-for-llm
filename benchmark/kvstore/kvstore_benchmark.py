@@ -495,13 +495,7 @@ def run_benchmark(args: argparse.Namespace) -> bool:
 
     block_hashes = make_block_hashes(num_blocks)
 
-    if iaxl_envs.IAXL_RDMA_ENABLE:
-        from iaxl.remote_pool.kvstore_remote import KVStoreRemote
-
-        kvstore_cls = KVStoreRemote
-    else:
-        kvstore_cls = KVStore
-    kvstore = kvstore_cls(
+    kvstore = KVStore(
         model_name="kvstore_benchmark",
         kv_caches=kv_caches,
         block_dim=BLOCK_DIM,

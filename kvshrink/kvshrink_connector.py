@@ -138,7 +138,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
         )
 
         if role == KVConnectorRole.SCHEDULER:
-            self.kvstore: Optional[KVStore] = self._kvstore_cls()(
+            self.kvstore: Optional[KVStore] = KVStore(
                 model_name=os.path.basename(self.model_config.model),
                 layer_names=[str(index) for index in range(self.num_layers)],
                 tp_size=self.tp_size,
@@ -148,14 +148,6 @@ class KVShrinkConnector(KVConnectorBase_V1):
             if not iaxl_envs.IAXL_RDMA_ENABLE:  # compression/DSA run on the daemon node
                 self._bind_cpu_affinity()
                 self._bind_intel_accel()
-
-    @staticmethod
-    def _kvstore_cls():
-        if iaxl_envs.IAXL_RDMA_ENABLE:
-            from iaxl.remote_pool.kvstore_remote import KVStoreRemote
-
-            return KVStoreRemote
-        return KVStore
 
     def _bind_cpu_affinity(self) -> None:
         if self.vllm_device == "cpu":
@@ -342,7 +334,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
         block_dim = 0 if self.use_mla or first_kv_cache.shape[1] == 2 else 1
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
-        self.kvstore = self._kvstore_cls()(
+        self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
             block_dim=block_dim,
             kv_caches=kv_caches,

@@ -4,7 +4,7 @@
 import logging
 import torch
 import numpy as np
-from typing import Dict, List, Mapping, Optional, Union
+from typing import Dict, List, Mapping, Optional, TYPE_CHECKING, Union
 import psutil
 from ..envs import envs
 from ..kvflow import KVFlow, Task, get_accelerator_device
@@ -26,7 +26,7 @@ def _get_default_cache_size_gb() -> float:
     return available_bytes / (10 * 1024**3)
 
 
-class KVStore:
+class KVStoreLocal:
     LABEL = "kv"
 
     def __init__(
@@ -320,3 +320,13 @@ class KVStore:
 
     def get_evict_candidates(self, max_count: int) -> List[str]:
         return self.tensorzip.get_evict_candidates(max_count)
+
+
+if TYPE_CHECKING:  # the two shells share one interface; pick the local one for typing
+    KVStore = KVStoreLocal
+elif envs.IAXL_RDMA_ENABLE:
+    from .kvstore_remote import KVStoreRemote
+
+    KVStore = KVStoreRemote
+else:
+    KVStore = KVStoreLocal

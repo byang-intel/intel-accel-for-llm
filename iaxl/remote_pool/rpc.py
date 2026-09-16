@@ -1,4 +1,4 @@
-"""RPC between KVStoreRemote (client) and the daemon's KVStore, over one NIXL agent.
+"""RPC between KVStoreRemote (client) and the daemon's KVStoreLocal, over one NIXL agent.
 
 Transport (§3.8 of DESIGN.md): every side owns a registered control buffer.
 Client requests RDMA-WRITE their payload into the daemon's buffer and carry the
@@ -191,7 +191,7 @@ class KVStoreService:
     def _register_kv_caches(self, peer, payload):
         from iaxl import torch_ext
         from iaxl.kvflow.remote_tensor import RemoteTensor
-        from iaxl.kvstore import KVStore
+        from iaxl.kvstore import KVStoreLocal
 
         req = unpack_json(payload)
         self._check_topology(req)
@@ -206,19 +206,19 @@ class KVStoreService:
             torch_ext.rdma_register_remote(peer, rt.base, list(shape), rt.element_size(), rt.dev_id, block_dim)
             self.remote_bases.append(rt.base)
             kv_caches[name] = rt
-        self.kvstore = KVStore(model_name=req["model_name"], block_dim=block_dim, kv_caches=kv_caches,
-                               rank=self.rank, tp_size=self.tp_size)
+        self.kvstore = KVStoreLocal(model_name=req["model_name"], block_dim=block_dim, kv_caches=kv_caches,
+                                    rank=self.rank, tp_size=self.tp_size)
         self._set_layers(self.kvstore.layer_names)
         return pack_json({"layer_names": self.layer_names})
 
     def _register_layers(self, peer, payload):
-        from iaxl.kvstore import KVStore
+        from iaxl.kvstore import KVStoreLocal
 
         req = unpack_json(payload)
         self._check_topology(req)
         if self.kvstore is None:
-            self.kvstore = KVStore(model_name=req["model_name"], layer_names=req["layer_names"],
-                                   tp_size=self.tp_size)
+            self.kvstore = KVStoreLocal(model_name=req["model_name"], layer_names=req["layer_names"],
+                                        tp_size=self.tp_size)
         self._set_layers(self.kvstore.layer_names)
         return b""
 
