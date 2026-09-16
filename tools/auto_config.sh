@@ -382,7 +382,7 @@ iaa_thread_count() {
 }
 
 # Succeeds when any of the given switch values is truthy.
-zip_backend_enabled() {
+env_truthy() {
     local v
     for v in "$@"; do
         case "${v,,}" in
@@ -434,7 +434,7 @@ validate_omp_config() {
     fi
     if ((IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS == 0)); then
         # No zip worker: KV blocks must be stored raw; OpenMP threads only do host copies.
-        if zip_backend_enabled "$IAXL_KV_COMPRESSION"; then
+        if env_truthy "$IAXL_KV_COMPRESSION"; then
             echo "ERROR: IAXL_KV_COMPRESSION=1 requires at least one zip backend; enable IAXL_QAT_ZIP_ENABLE/IAXL_IAA_ZIP_ENABLE/IAXL_CPU_ZIP_ENABLE or set IAXL_KV_COMPRESSION=0" >&2
             return 1
         fi

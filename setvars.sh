@@ -116,7 +116,7 @@ case "${IAXL_CPU_ZIP_ENABLE,,}" in
         ;;
     *) export IAXL_CPU_ZIP_THREADS=0 ;;
 esac
-if zip_backend_enabled "$IAXL_QAT_ZIP_ENABLE" "$IAXL_IAA_ZIP_ENABLE" "$IAXL_CPU_ZIP_ENABLE"; then
+if env_truthy "$IAXL_QAT_ZIP_ENABLE" "$IAXL_IAA_ZIP_ENABLE" "$IAXL_CPU_ZIP_ENABLE"; then
     export IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM") || return 1 2>/dev/null || exit 1
 else
     # No zip worker: OpenMP threads only copy raw KV blocks on the host; cap at 4.
@@ -155,6 +155,9 @@ export IAXL_RDMA_TP_SIZE=${IAXL_RDMA_TP_SIZE:-$TP_SIZE}       # Daemon rank proc
 
 HOST_IP=$(ip route get 1 | awk '{print $7}' | tr -d '\n')
 export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,${HOST_IP}
+if env_truthy "$IAXL_RDMA_ENABLE" && [[ -n "$IAXL_RDMA_DAEMON_IP" ]]; then
+    export no_proxy="$no_proxy,$IAXL_RDMA_DAEMON_IP"
+fi
 export http_proxy="${http_proxy:-}"
 export https_proxy=$http_proxy
 
