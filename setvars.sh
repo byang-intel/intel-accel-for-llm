@@ -116,7 +116,16 @@ case "${IAXL_CPU_ZIP_ENABLE,,}" in
         ;;
     *) export IAXL_CPU_ZIP_THREADS=0 ;;
 esac
-export IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM") || return 1 2>/dev/null || exit 1
+if zip_backend_enabled "$IAXL_QAT_ZIP_ENABLE" "$IAXL_IAA_ZIP_ENABLE" "$IAXL_CPU_ZIP_ENABLE"; then
+    export IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM") || return 1 2>/dev/null || exit 1
+else
+    # No zip worker: OpenMP threads only copy raw KV blocks on the host; cap at 4.
+    if [[ -z "$IAXL_OMP_THREAD_NUM" ]]; then
+        IAXL_OMP_THREAD_NUM=$(cpu_zip_thread_count "$MIN_RANK_CPU_COUNT" 0 "$IAXL_RESERVED_CPU_NUM" 0) || return 1 2>/dev/null || exit 1
+        ((IAXL_OMP_THREAD_NUM > 4)) && IAXL_OMP_THREAD_NUM=4
+    fi
+    export IAXL_OMP_THREAD_NUM
+fi
 export OMP_NUM_THREADS=$IAXL_OMP_THREAD_NUM
 export OMP_THREAD_LIMIT=$IAXL_OMP_THREAD_NUM
 export OMP_MAX_ACTIVE_LEVELS=2

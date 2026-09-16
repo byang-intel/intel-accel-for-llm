@@ -49,6 +49,16 @@ class Envs:
         self.IAXL_DEBUG = _bool("IAXL_DEBUG")
 
         self.IAXL_KV_COMPRESSION = _bool("IAXL_KV_COMPRESSION", True)
+        if self.IAXL_KV_COMPRESSION and not (
+            _bool("IAXL_QAT_ZIP_ENABLE", True)
+            or _bool("IAXL_IAA_ZIP_ENABLE")
+            or _bool("IAXL_CPU_ZIP_ENABLE", True)
+        ):
+            raise ValueError(
+                "IAXL_KV_COMPRESSION=1 requires at least one zip backend; "
+                "enable IAXL_QAT_ZIP_ENABLE/IAXL_IAA_ZIP_ENABLE/IAXL_CPU_ZIP_ENABLE "
+                "or set IAXL_KV_COMPRESSION=0"
+            )
         self.IAXL_DSA_GD_ENABLE = _bool("IAXL_DSA_GD_ENABLE")
         self.IAXL_CACHE_DIR = _str("IAXL_CACHE_DIR", "_data/kvcache")
         self.IAXL_CACHE_STREAM_SYNC_ON_GET = _bool("IAXL_CACHE_STREAM_SYNC_ON_GET")

@@ -77,8 +77,17 @@ __attribute__((constructor(101))) void envs_init(void) {
     envs.IAXL_OMP_THREAD_NUM =
         env_int("OMP_NUM_THREADS", envs.IAXL_QAT_INSTANCE_NUM + envs.IAXL_IAA_INSTANCE_NUM +
                                        envs.IAXL_CPU_ZIP_THREADS);
+    if (envs.IAXL_OMP_THREAD_NUM < 1)
+        envs.IAXL_OMP_THREAD_NUM = 1;
 
     envs.IAXL_KV_COMPRESSION = env_bool("IAXL_KV_COMPRESSION", 1);
+    if (envs.IAXL_KV_COMPRESSION && !envs.IAXL_QAT_ZIP_ENABLE && !envs.IAXL_IAA_ZIP_ENABLE &&
+        !envs.IAXL_CPU_ZIP_ENABLE) {
+        fprintf(stderr, "[iaxl] ERROR: IAXL_KV_COMPRESSION=1 requires at least one zip backend; "
+                        "enable IAXL_QAT_ZIP_ENABLE/IAXL_IAA_ZIP_ENABLE/IAXL_CPU_ZIP_ENABLE "
+                        "or set IAXL_KV_COMPRESSION=0\n");
+        abort();
+    }
     envs.IAXL_KV_LOSSY_TRUNC = env_int("IAXL_KV_LOSSY_TRUNC", 0);
     envs.IAXL_KV_DATA_SHUFFLE = env_bool("IAXL_KV_DATA_SHUFFLE", 0);
     envs.IAXL_CACHE_CACHEGROUP_SIZE = env_int("IAXL_CACHE_CACHEGROUP_SIZE", 100);

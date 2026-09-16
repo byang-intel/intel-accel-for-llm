@@ -381,6 +381,17 @@ iaa_thread_count() {
     echo "$((devices * instances_per_device))"
 }
 
+# Succeeds when any of the given switch values is truthy.
+zip_backend_enabled() {
+    local v
+    for v in "$@"; do
+        case "${v,,}" in
+            1|true|yes|on) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 omp_thread_count() {
     local qat_threads=$1
     local cpu_zip_threads=$2
@@ -422,10 +433,16 @@ validate_omp_config() {
         return 1
     fi
     if ((IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS == 0)); then
-        echo "ERROR: at least one QAT, IAA or CPU zip worker must be enabled" >&2
-        return 1
-    fi
-    if ! [[ "$IAXL_OMP_THREAD_NUM" =~ ^[1-9][0-9]*$ ]] ||
+        # No zip worker: KV blocks must be stored raw; OpenMP threads only do host copies.
+        if zip_backend_enabled "$IAXL_KV_COMPRESSION"; then
+            echo "ERROR: IAXL_KV_COMPRESSION=1 requires at least one zip backend; enable IAXL_QAT_ZIP_ENABLE/IAXL_IAA_ZIP_ENABLE/IAXL_CPU_ZIP_ENABLE or set IAXL_KV_COMPRESSION=0" >&2
+            return 1
+        fi
+        if ! [[ "$IAXL_OMP_THREAD_NUM" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: IAXL_OMP_THREAD_NUM must be a positive integer" >&2
+            return 1
+        fi
+    elif ! [[ "$IAXL_OMP_THREAD_NUM" =~ ^[1-9][0-9]*$ ]] ||
         ((IAXL_OMP_THREAD_NUM != IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS)); then
         echo "ERROR: IAXL_OMP_THREAD_NUM must equal IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS" >&2
         return 1
