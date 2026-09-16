@@ -7,6 +7,7 @@
 
 #include "context.h"
 #include "kv_pool.h"
+#include "kv_xfer_rdma.h"
 
 using namespace profiler;
 
@@ -35,6 +36,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("tensor"), py::arg("chunk_dim"),
             py::arg("direction") = GpuTransferDirection::H2D, py::arg("name") = "gpu_xfer",
             py::arg("work_stream") = py::none())
+        .def_static("create_remote", &Context::create_remote,
+                    "Create transfer context for a client tensor registered via rdma_register_remote.",
+                    py::arg("base"), py::arg("dev_id"), py::arg("shape"), py::arg("elem_size"),
+                    py::arg("chunk_dim"), py::arg("direction") = GpuTransferDirection::H2D,
+                    py::arg("name") = "rdma_xfer")
         .def("xfer_wait_cur_stream", &Context::xfer_wait_cur_stream,
              "Make work_stream wait for cur_stream's pending work (GPU-side, async).\n"
              "sync_cur_stream: if True, additionally CPU-blocking wait until cur_stream's\n"
@@ -497,4 +503,39 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return d;
         },
         "Read accumulated compression/decompression throughput metrics (GB/s is decimal)");
+
+    m.def("rdma_init", &kv_xfer::rdma_init, py::arg("name"), py::arg("listen_port"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("rdma_wait_peer", &kv_xfer::rdma_wait_peer, py::arg("peer"), py::arg("timeout_s") = 60.0,
+          py::call_guard<py::gil_scoped_release>());
+    m.def("rdma_remove_peer", &kv_xfer::rdma_remove_peer, py::arg("peer"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("rdma_register_mem", &kv_xfer::rdma_register_mem, py::arg("base"), py::arg("bytes"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("rdma_register_local", &kv_xfer::rdma_register_local, py::arg("base"), py::arg("bytes"),
+          py::arg("block_bytes"), py::call_guard<py::gil_scoped_release>());
+    m.def("rdma_register_remote", &kv_xfer::rdma_register_remote, py::arg("peer"), py::arg("base"),
+          py::arg("shape"), py::arg("elem_size"), py::arg("dev_id"), py::arg("chunk_dim"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("rdma_unregister_remote", &kv_xfer::rdma_unregister_remote, py::arg("base"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def(
+        "rdma_send_notif",
+        [](const std::string &peer, const py::bytes &msg) {
+            std::string s = msg;
+            py::gil_scoped_release release;
+            kv_xfer::rdma_send_notif(peer, s);
+        },
+        py::arg("peer"), py::arg("msg"));
+    m.def("rdma_get_notifs", []() {
+        std::vector<std::pair<std::string, std::string>> notifs;
+        {
+            py::gil_scoped_release release;
+            notifs = kv_xfer::rdma_get_notifs();
+        }
+        py::list out;
+        for (auto &[peer, msg] : notifs)
+            out.append(py::make_tuple(peer, py::bytes(msg)));
+        return out;
+    });
 }

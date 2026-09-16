@@ -20,6 +20,7 @@
 using namespace profiler;
 
 #include "kv_xfer.h"
+#include "kv_xfer_rdma.h"
 
 namespace kv_pool {
 class Mem;
@@ -40,7 +41,7 @@ class Context {
         ctx.name_ = name;
         ctx.gpu_tensor_ = tensor;
         ctx.direction_ = direction;
-        ctx.event_ = kv_xfer::event_acquire();
+        ctx.event_ = ctx.ops_->event_acquire();
         ctx.queue_ = &((direction == GpuTransferDirection::H2D) ? h2d_queue() : d2h_queue());
 
         int64_t outer_dims = 1;
@@ -55,9 +56,35 @@ class Context {
         ctx.xctx_ = kv_xfer::context_create((char *)tensor.data_ptr(), tensor.device().index(),
                                             chunk_stride, outer_dims, inner_size, outer_block_size,
                                             work_stream);
-        ctx.stream_id_ = kv_xfer::context_stream_id(ctx.xctx_);
+        ctx.stream_id_ = ctx.ops_->context_stream_id(ctx.xctx_);
 
         PROFILE_SCOPE_FMT("ctx_create(%s,stream=%llu)", name.c_str(), ctx.stream_id_);
+        return ctx;
+    }
+
+    // Remote (RDMA) tensor: only its address and contiguous geometry are known here.
+    static Context create_remote(uintptr_t base, int dev_id, const std::vector<int64_t> &shape,
+                                 int64_t elem_size, int chunk_dim,
+                                 GpuTransferDirection direction = GpuTransferDirection::H2D,
+                                 const std::string &name = "") {
+        Context ctx;
+        ctx.ops_ = &kv_xfer::rdma_ops();
+        ctx.name_ = name;
+        ctx.direction_ = direction;
+        ctx.event_ = ctx.ops_->event_acquire();
+        ctx.queue_ = &((direction == GpuTransferDirection::H2D) ? h2d_queue() : d2h_queue());
+
+        int64_t outer_dims = 1;
+        for (int d = 0; d < chunk_dim; d++)
+            outer_dims *= shape[d];
+        int64_t inner_size = elem_size;
+        for (size_t d = chunk_dim + 1; d < shape.size(); d++)
+            inner_size *= shape[d];
+        int64_t outer_block_size = shape[chunk_dim] * inner_size;
+
+        ctx.xctx_ = kv_xfer::rdma_context_create((char *)base, inner_size, outer_dims, inner_size,
+                                                 outer_block_size);
+        PROFILE_SCOPE_FMT("ctx_create_remote(%s)", name.c_str());
         return ctx;
     }
 
@@ -98,16 +125,17 @@ class Context {
     Context() = default;
     ~Context() {
         check_no_pending_work();
-        kv_xfer::event_release(event_);
-        kv_xfer::context_destroy(xctx_);
+        ops_->event_release(event_);
+        ops_->context_destroy(xctx_);
     }
     Context(Context &&other) noexcept { *this = std::move(other); }
     Context &operator=(Context &&other) noexcept {
         if (this != &other) {
             check_no_pending_work();
-            kv_xfer::event_release(event_);
-            kv_xfer::context_destroy(xctx_);
+            ops_->event_release(event_);
+            ops_->context_destroy(xctx_);
 
+            ops_ = other.ops_;
             xctx_ = other.xctx_;
             stream_id_ = other.stream_id_;
             gpu_tensor_ = std::move(other.gpu_tensor_);
@@ -137,6 +165,7 @@ class Context {
         IAXL_CHECK(!unzip_future_.valid(), "Context destroyed before unzip_wait completed");
     }
 
+    const kv_xfer::Ops *ops_ = &kv_xfer::gpu_ops();
     kv_xfer::context_t xctx_ = nullptr;
     unsigned long long stream_id_ = 0;
     torch::Tensor gpu_tensor_;

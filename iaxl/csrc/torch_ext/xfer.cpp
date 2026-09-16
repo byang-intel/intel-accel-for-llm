@@ -11,11 +11,12 @@ void Context::xfer_chunk(const torch::Tensor &cpu_tensor, int64_t chunk_idx) {
     char *cpu_base = (char *)cpu_tensor.data_ptr();
     bool h2d = (direction_ == GpuTransferDirection::H2D);
     auto x = xctx_;
+    auto ops = ops_;
 
     queue_->submit([=]() {
         PROFILE_SCOPE_FMT("xfer_chunk(%s,stream=%llu,idx=%ld)", name_.c_str(), stream_id_,
                           chunk_idx);
-        kv_xfer::copy_chunk(x, cpu_base, chunk_idx, h2d);
+        ops->copy_chunk(x, cpu_base, chunk_idx, h2d);
     });
 }
 
@@ -27,6 +28,7 @@ void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
     auto chunk_indices_copy = chunk_indices;
     bool h2d = (direction_ == GpuTransferDirection::H2D);
     auto x = xctx_;
+    auto ops = ops_;
 
     std::vector<char *> cpu_ptrs;
     cpu_ptrs.reserve(cpu_tensors.size());
@@ -37,7 +39,7 @@ void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
     queue_->submit([=, chunk_indices = std::move(chunk_indices_copy)]() {
         PROFILE_SCOPE_FMT("xfer_chunks_batch(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
                           stream_id_, chunk_indices.size(), chunk_indices[0]);
-        kv_xfer::copy_chunks_batch(x, chunk_indices, cpu_ptrs, h2d);
+        ops->copy_chunks_batch(x, chunk_indices, cpu_ptrs, h2d);
     });
 }
 
@@ -63,11 +65,12 @@ void Context::xfer_chunks_batch_fast(const torch::Tensor &chunk_indices,
 
     bool h2d = (direction_ == GpuTransferDirection::H2D);
     auto x = xctx_;
+    auto ops = ops_;
 
     queue_->submit([=, indices = std::move(indices), ptrs = std::move(ptrs)]() {
         PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
                           stream_id_, indices.size(), indices[0]);
-        kv_xfer::copy_chunks_batch(x, indices, ptrs, h2d);
+        ops->copy_chunks_batch(x, indices, ptrs, h2d);
     });
 }
 
@@ -75,11 +78,12 @@ void Context::xfer_finish() {
     PROFILE_SCOPE_FMT("xfer_finish(%s,stream=%llu)", name_.c_str(), stream_id_);
     auto event = event_;
     auto x = xctx_;
+    auto ops = ops_;
     auto *ev_flag = &event_recorded_;
 
     xfer_last_future_ = queue_->submit([=]() {
         PROFILE_SCOPE_FMT("xfer_finish(%s,stream=%llu)", name_.c_str(), stream_id_);
-        kv_xfer::context_record_event(x, event);
+        ops->context_record_event(x, event);
         ev_flag->store(true, std::memory_order_release);
     });
 }
@@ -93,10 +97,10 @@ void Context::xfer_wait() {
     }
     {
         PROFILE_SCOPE_FMT("event_wait(%s,stream=%llu)", name_.c_str(), stream_id_);
-        kv_xfer::event_synchronize(event_);
+        ops_->event_synchronize(event_);
 
-        if (direction_ == GpuTransferDirection::H2D && !kv_xfer::context_same_stream(xctx_)) {
-            kv_xfer::context_cur_wait_event(xctx_, event_);
+        if (direction_ == GpuTransferDirection::H2D && !ops_->context_same_stream(xctx_)) {
+            ops_->context_cur_wait_event(xctx_, event_);
         }
     }
 }
@@ -116,26 +120,28 @@ bool Context::xfer_is_complete() {
 }
 
 void Context::xfer_wait_cur_stream(bool sync_cur_stream) {
-    if (kv_xfer::context_same_stream(xctx_) && !sync_cur_stream)
+    if (ops_->context_same_stream(xctx_) && !sync_cur_stream)
         return;
     if (sync_cur_stream) {
         PROFILE_SCOPE("sync_cur_stream");
 
-        kv_xfer::context_sync_cur(xctx_);
+        ops_->context_sync_cur(xctx_);
     }
     auto x = xctx_;
-    queue_->submit([x]() {
+    auto ops = ops_;
+    queue_->submit([x, ops]() {
         PROFILE_SCOPE("wait_cur_stream");
-        kv_xfer::context_work_wait_cur(x);
+        ops->context_work_wait_cur(x);
     });
 }
 
 void Context::xfer_wait_stream(kv_xfer::event_t wait_event) {
     auto x = xctx_;
-    queue_->submit([x, wait_event]() {
+    auto ops = ops_;
+    queue_->submit([x, ops, wait_event]() {
         PROFILE_SCOPE("wait_stream");
-        kv_xfer::context_work_wait_event(x, wait_event);
-        kv_xfer::event_destroy(wait_event);
+        ops->context_work_wait_event(x, wait_event);
+        kv_xfer::event_destroy(wait_event); // wait_event always comes from the GPU backend
     });
 }
 

@@ -83,6 +83,54 @@ compress_cpu_list() {
     '
 }
 
+# Fallback for GPU-less hosts: split every physical core evenly across the ranks.
+cpu_even_split() {
+    local tp_size=$1
+    local online_path cpu topology siblings rank cores_per_rank extra_cores core_count core_start offset cpu_group result
+    local -a core_groups=() cpu_ids=() rank_cpu_groups=()
+    local -A seen_cores=()
+
+    validate_tp_size "$tp_size" || return 1
+    online_path=/sys/devices/system/cpu/online
+    if [[ ! -r "$online_path" ]]; then
+        echo "ERROR: cannot read $online_path to split CPUs across ranks" >&2
+        return 1
+    fi
+
+    while read -r cpu; do
+        topology=/sys/devices/system/cpu/cpu$cpu/topology
+        [[ -r "$topology/thread_siblings_list" ]] || continue
+        siblings=$(<"$topology/thread_siblings_list")
+        [[ -n "${seen_cores[$siblings]:-}" ]] && continue
+        seen_cores[$siblings]=1
+        core_groups+=("$cpu")
+    done < <(expand_cpu_list "$(<"$online_path")")
+
+    if ((${#core_groups[@]} < tp_size)); then
+        echo "ERROR: only ${#core_groups[@]} physical cores are available for TP_SIZE=$tp_size" >&2
+        return 1
+    fi
+
+    cores_per_rank=$((${#core_groups[@]} / tp_size))
+    extra_cores=$((${#core_groups[@]} % tp_size))
+    for ((rank = 0; rank < tp_size; rank++)); do
+        core_count=$cores_per_rank
+        ((rank < extra_cores)) && core_count=$((core_count + 1))
+        core_start=$((rank * cores_per_rank + (rank < extra_cores ? rank : extra_cores)))
+
+        cpu_ids=()
+        for ((offset = 0; offset < core_count; offset++)); do
+            cpu_ids+=("${core_groups[$((core_start + offset))]}")
+        done
+        cpu_group=$(compress_cpu_list "${cpu_ids[@]}")
+        rank_cpu_groups+=("$cpu_group")
+        echo "KVShrink CPU rank $rank: GPU=none CPUs=$cpu_group" >&2
+    done
+
+    result=$(IFS='|'; echo "${rank_cpu_groups[*]}")
+    echo "$result"
+}
+
 cpu_auto_detect() {
     local tp_size=${1:-${TP_SIZE:-}}
     local gpu_output rank gpu_index pci_bus numa node_path cpu topology siblings
@@ -91,7 +139,12 @@ cpu_auto_detect() {
     local -a cpu_ids=() rank_cpu_groups=()
     local -A ranks_per_numa=() next_rank_on_numa=() seen_cores=()
 
-    gpu_output=$(gpu_rows "$tp_size") || return 1
+    validate_tp_size "$tp_size" || return 1
+    if ! gpu_output=$(gpu_rows "$tp_size" 2>/dev/null); then
+        echo "WARNING: no usable NVIDIA GPU detected, splitting CPUs evenly across $tp_size ranks" >&2
+        cpu_even_split "$tp_size"
+        return
+    fi
     mapfile -t gpu_rows <<<"$gpu_output"
 
     for ((rank = 0; rank < tp_size; rank++)); do
@@ -381,6 +434,17 @@ iaa_thread_count() {
     echo "$((devices * instances_per_device))"
 }
 
+# Succeeds when any of the given switch values is truthy.
+env_truthy() {
+    local v
+    for v in "$@"; do
+        case "${v,,}" in
+            1|true|yes|on) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 omp_thread_count() {
     local qat_threads=$1
     local cpu_zip_threads=$2
@@ -422,10 +486,16 @@ validate_omp_config() {
         return 1
     fi
     if ((IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS == 0)); then
-        echo "ERROR: at least one QAT, IAA or CPU zip worker must be enabled" >&2
-        return 1
-    fi
-    if ! [[ "$IAXL_OMP_THREAD_NUM" =~ ^[1-9][0-9]*$ ]] ||
+        # No zip worker: KV blocks must be stored raw; OpenMP threads only do host copies.
+        if env_truthy "$IAXL_KV_COMPRESSION"; then
+            echo "ERROR: IAXL_KV_COMPRESSION=1 requires at least one zip backend; enable IAXL_QAT_ZIP_ENABLE/IAXL_IAA_ZIP_ENABLE/IAXL_CPU_ZIP_ENABLE or set IAXL_KV_COMPRESSION=0" >&2
+            return 1
+        fi
+        if ! [[ "$IAXL_OMP_THREAD_NUM" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: IAXL_OMP_THREAD_NUM must be a positive integer" >&2
+            return 1
+        fi
+    elif ! [[ "$IAXL_OMP_THREAD_NUM" =~ ^[1-9][0-9]*$ ]] ||
         ((IAXL_OMP_THREAD_NUM != IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS)); then
         echo "ERROR: IAXL_OMP_THREAD_NUM must equal IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS" >&2
         return 1

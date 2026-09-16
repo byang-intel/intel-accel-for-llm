@@ -13,7 +13,7 @@ set(DEVICE
     "cuda"
     CACHE STRING "Accelerator backend: cuda or xpu")
 set_property(CACHE DEVICE PROPERTY STRINGS cuda xpu)
-if(NOT DEVICE STREQUAL "cuda" AND NOT DEVICE STREQUAL "xpu")
+if(NOT DEVICE MATCHES "^(cuda|xpu)$")
     message(FATAL_ERROR "Unsupported DEVICE=${DEVICE}; expected cuda or xpu")
 endif()
 
@@ -73,7 +73,7 @@ file(GLOB CPU_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/cpu_zip/*.c")
 file(GLOB IAA_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/iaa_zip/*.c")
 file(GLOB COMMON_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/common/*.c")
 set(IAXL_SRCS ${TORCH_EXT_SRCS} ${KV_POOL_SRCS} ${KV_ZIP_SRCS} ${QAT_ZIP_SRCS} ${CPU_ZIP_SRCS}
-              ${IAA_ZIP_SRCS} ${COMMON_SRCS})
+              ${IAA_ZIP_SRCS} ${COMMON_SRCS} "${IAXL_CSRC_DIR}/kv_xfer/rdma.cpp")
 
 if(DEVICE STREQUAL "cuda")
     list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/cuda.cpp" "${IAXL_CSRC_DIR}/kv_xfer/dsa.cpp")
@@ -124,6 +124,16 @@ target_link_directories(torch_ext PRIVATE "${PYTORCH_PATH}/lib" "${IAXL_LIB_DIR}
 find_package(ZLIB REQUIRED)
 target_link_libraries(torch_ext PRIVATE torch torch_python qat_s usdm_drv_s qpl ZLIB::ZLIB dl)
 
+find_path(NIXL_INCLUDE_DIR nixl.h HINTS $ENV{NIXL_INCLUDE_DIR} PATHS /usr/local/include NO_DEFAULT_PATH)
+find_library(NIXL_LIBRARY nixl HINTS $ENV{NIXL_LIB_DIR} PATHS /usr/local/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
+if(NOT NIXL_INCLUDE_DIR OR NOT NIXL_LIBRARY)
+    message(FATAL_ERROR "NIXL not found; set NIXL_INCLUDE_DIR / NIXL_LIB_DIR")
+endif()
+get_filename_component(NIXL_LIB_DIR "${NIXL_LIBRARY}" DIRECTORY)
+message(STATUS "NIXL: ${NIXL_INCLUDE_DIR} ${NIXL_LIBRARY}")
+target_include_directories(torch_ext PRIVATE "${NIXL_INCLUDE_DIR}")
+target_link_libraries(torch_ext PRIVATE "${NIXL_LIBRARY}")
+
 if(DEVICE STREQUAL "cuda")
     find_package(CUDAToolkit REQUIRED)
     target_compile_definitions(torch_ext PRIVATE CUDA_SUPPORT=1 DSA_SUPPORT=1)
@@ -168,5 +178,5 @@ endif()
 set_target_properties(
     torch_ext
     PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/iaxl"
-               BUILD_RPATH "${IAXL_LIB_DIR}"
-               INSTALL_RPATH "${IAXL_LIB_DIR}:$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib")
+               BUILD_RPATH "${IAXL_LIB_DIR}:${NIXL_LIB_DIR}"
+               INSTALL_RPATH "${IAXL_LIB_DIR}:$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib:${NIXL_LIB_DIR}")

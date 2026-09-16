@@ -62,8 +62,6 @@ static constexpr size_t kNoTask = static_cast<size_t>(-1);
 static void ensure_zip_init() {
     static std::once_flag flag;
     std::call_once(flag, [] {
-        IAXL_CHECK(envs.IAXL_QAT_ZIP_ENABLE || envs.IAXL_IAA_ZIP_ENABLE || envs.IAXL_CPU_ZIP_ENABLE,
-                   "kv_zip: QAT, IAA and CPU zip backends are all disabled");
         if (envs.IAXL_QAT_ZIP_ENABLE)
             IAXL_CHECK(qat_zip_init() == 0, "kv_zip: qat_zip_init failed");
         if (envs.IAXL_IAA_ZIP_ENABLE)

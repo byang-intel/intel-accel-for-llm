@@ -81,6 +81,7 @@ export IAXL_CACHE_STREAM_SYNC_ON_GET=${IAXL_CACHE_STREAM_SYNC_ON_GET:-0} # CPU-s
 export IAXL_CACHE_CACHEGROUP_SIZE=${IAXL_CACHE_CACHEGROUP_SIZE:-100}     # Reserved entries per cache group
 export IAXL_CACHE_CACHEGROUP_NUM=${IAXL_CACHE_CACHEGROUP_NUM:-100000}    # Reserved number of cache groups
 export IAXL_PREALLOC_LIMIT=${IAXL_PREALLOC_LIMIT:-0}                     # Cap pinned scratch-pool pre-allocation (0 = unlimited)
+export IAXL_SCRATCH_POOL_SIZE_GB=${IAXL_SCRATCH_POOL_SIZE_GB:-8}         # Pinned scratch pool (GPU<->CPU staging) size in GB
 export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS:-1} # Store the first N KV layers without compression
 # export IAXL_DDR_POOL_SIZE_GB=...         # DDR (host) cache pool size in GB (unset = 1/10 of RAM)
 
@@ -115,7 +116,16 @@ case "${IAXL_CPU_ZIP_ENABLE,,}" in
         ;;
     *) export IAXL_CPU_ZIP_THREADS=0 ;;
 esac
-export IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM") || return 1 2>/dev/null || exit 1
+if env_truthy "$IAXL_QAT_ZIP_ENABLE" "$IAXL_IAA_ZIP_ENABLE" "$IAXL_CPU_ZIP_ENABLE"; then
+    export IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM") || return 1 2>/dev/null || exit 1
+else
+    # No zip worker: OpenMP threads only copy raw KV blocks on the host; cap at 4.
+    if [[ -z "$IAXL_OMP_THREAD_NUM" ]]; then
+        IAXL_OMP_THREAD_NUM=$(cpu_zip_thread_count "$MIN_RANK_CPU_COUNT" 0 "$IAXL_RESERVED_CPU_NUM" 0) || return 1 2>/dev/null || exit 1
+        ((IAXL_OMP_THREAD_NUM > 4)) && IAXL_OMP_THREAD_NUM=4
+    fi
+    export IAXL_OMP_THREAD_NUM
+fi
 export OMP_NUM_THREADS=$IAXL_OMP_THREAD_NUM
 export OMP_THREAD_LIMIT=$IAXL_OMP_THREAD_NUM
 export OMP_MAX_ACTIVE_LEVELS=2
@@ -136,8 +146,18 @@ export IAXL_API_WORKER_BASE_PORT=${IAXL_API_WORKER_BASE_PORT:-18800} # Worker se
 export IAXL_API_CONTROLLER_PORT=${IAXL_API_CONTROLLER_PORT:-18700}   # Controller server port
 export IAXL_API_TIMEOUT=${IAXL_API_TIMEOUT:-60}                      # HTTP request timeout in seconds
 
+# ---- Remote pool (KVStore daemon over RDMA/NIXL) ----------------------------
+export IAXL_RDMA_ENABLE=${IAXL_RDMA_ENABLE:-0}                # Use remote KVStore daemon instead of local KVStore (0/1)
+export IAXL_RDMA_DAEMON_IP=${IAXL_RDMA_DAEMON_IP:-}           # Daemon RDMA NIC IP (metadata + UCX device selection)
+export IAXL_RDMA_CLIENT_IP=${IAXL_RDMA_CLIENT_IP:-}           # Client RDMA NIC IP (UCX device selection)
+export IAXL_RDMA_DAEMON_PORT=${IAXL_RDMA_DAEMON_PORT:-5555}   # Scheduler port; rank r listens on port+1+r
+export IAXL_RDMA_TP_SIZE=${IAXL_RDMA_TP_SIZE:-$TP_SIZE}       # Daemon rank process count (must equal client TP)
+
 HOST_IP=$(ip route get 1 | awk '{print $7}' | tr -d '\n')
 export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,${HOST_IP}
+if env_truthy "$IAXL_RDMA_ENABLE" && [[ -n "$IAXL_RDMA_DAEMON_IP" ]]; then
+    export no_proxy="$no_proxy,$IAXL_RDMA_DAEMON_IP"
+fi
 export http_proxy="${http_proxy:-}"
 export https_proxy=$http_proxy
 

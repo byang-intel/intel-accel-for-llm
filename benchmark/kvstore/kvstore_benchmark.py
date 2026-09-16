@@ -32,11 +32,15 @@ os.environ["IAXL_KV_LOSSY_TRUNC"] = str(_env_args.quant)
 os.environ["IAXL_KV_DATA_SHUFFLE"] = str(_env_args.data_shuffle)
 
 from iaxl.kvstore import KVStore, get_accelerator_device
+from iaxl.envs import envs as iaxl_envs
 
 DEFAULT_KV_CACHE_SHAPE = (2, 1024, 16, 4, 128)
 
 
-DEFAULT_METRICS_URL = "http://127.0.0.1:18800/v1/cache/metrics"
+if iaxl_envs.IAXL_RDMA_ENABLE:
+    DEFAULT_METRICS_URL = f"http://{iaxl_envs.IAXL_RDMA_DAEMON_IP}:18800/v1/cache/metrics"
+else:
+    DEFAULT_METRICS_URL = "http://127.0.0.1:18800/v1/cache/metrics"
 DEFAULT_KV_DATA_DIR = "/_data/kvstore_benchmark"
 DEFAULT_MODEL_SEQ_LEN = 16384
 SEED = 42
@@ -583,12 +587,7 @@ def run_benchmark(args: argparse.Namespace) -> bool:
 
 def main() -> int:
     args = parse_args()
-    try:
-        return 0 if run_benchmark(args) else 1
-    except Exception as error:
-        print(f"\nBenchmark FAILED: {error}")
-        return 1
-
+    run_benchmark(args)
 
 if __name__ == "__main__":
     raise SystemExit(main())

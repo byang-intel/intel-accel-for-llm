@@ -1,210 +1,74 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
-import threading
+"""Fixed-size pinned scratch pool: one big [num_blocks, *block_shape] tensor
+(IAXL_SCRATCH_POOL_SIZE_GB), blocks handed out as views. No growth: allocate()
+raises once the pool is exhausted.
+
+Each block carries its slot as `tensor.block_idx`, which is also its offset in
+`pool` (register `pool` once for RDMA and use block_idx as the descriptor index).
+allocate()/release() are not thread-safe: call them from one thread only.
+"""
+
 import logging
-from typing import Dict, List, Tuple
-from ..utils.profiler import profile_scope, profile_cross_scope, profile_func
+import math
+from typing import List, Optional, Sequence, Tuple
+
+import torch
+
 from ..envs import envs
 
 logger = logging.getLogger(__name__)
 
 
 class ScratchPool:
-    def __init__(self, cache_size_gb: float, min_create_count: int = 2048):
-        self._cache_size_gb = cache_size_gb
-        self._min_create_count = min_create_count
-
-        prealloc_limit = envs.IAXL_PREALLOC_LIMIT
-        if prealloc_limit > 0:
-            self._min_create_count = min(self._min_create_count, prealloc_limit)
-
-        self._pools: Dict[Tuple[Tuple[int, ...], torch.dtype], List[torch.Tensor]] = {}
-        self._lock = threading.Lock()
-
-        self._total_bytes = 0
-        self._total_tensors = 0
-
+    def __init__(self, block_shape: Sequence[int], dtype: torch.dtype, pin_memory: bool = True):
+        self.block_shape = tuple(block_shape)
+        self.dtype = dtype
+        self.block_bytes = math.prod(self.block_shape) * torch.tensor([], dtype=dtype).element_size()
+        num_blocks = int(envs.IAXL_SCRATCH_POOL_SIZE_GB * 1024**3) // self.block_bytes
+        self.pool = torch.empty((num_blocks, *self.block_shape), dtype=dtype, device="cpu", pin_memory=pin_memory)
+        assert not pin_memory or self.pool.is_pinned(), "ScratchPool: pin_memory=True did not take effect"
+        self._blocks: Tuple[torch.Tensor, ...] = self.pool.unbind(0)
+        for i, t in enumerate(self._blocks):
+            t.block_idx = i  # type: ignore[attr-defined]
+        self._free: List[int] = list(range(num_blocks))  # LIFO: pop from the end
         self._allocate_count = 0
         self._release_count = 0
+        logger.info("ScratchPool: %d x %s %s = %.2f MB pinned",
+                    num_blocks, self.block_shape, dtype, self.pool.nbytes / 2**20)
 
-        self._debug = False
+    @property
+    def num_blocks(self) -> int:
+        return len(self._blocks)
 
-        self._pinned_check_warned = False
+    def allocate(self, count: int, shape: Optional[Sequence[int]] = None,
+                 dtype: Optional[torch.dtype] = None) -> List[torch.Tensor]:
+        free = self._free
+        if count > len(free):
+            raise RuntimeError(f"ScratchPool exhausted: need {count}, {len(free)}/{len(self._blocks)} free")
+        cut = len(free) - count  # not free[-count:], which is the whole list for count == 0
+        idx = free[cut:]
+        del free[cut:]
+        self._allocate_count += count
+        blocks = self._blocks
+        return [blocks[i] for i in idx]
 
-        logger.info(
-            "ScratchPool initialized (on-demand allocation, min_create=%d, debug=%s)",
-            self._min_create_count,
-            self._debug,
-        )
-
-    def _get_pool_key(
-        self, shape: Tuple[int, ...], dtype: torch.dtype
-    ) -> Tuple[Tuple[int, ...], torch.dtype]:
-        return (tuple(shape), dtype)
-
-    def _create_tensor(
-        self, shape: Tuple[int, ...], dtype: torch.dtype
-    ) -> torch.Tensor:
-        tensor = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-
-        if not self._pinned_check_warned:
-            logger.warning(
-                "ScratchPool._create_tensor: verifying pinned per newly created "
-                "tensor here (checks each one individually); this adds a small "
-                "one-time cost at allocation/warmup so the DSA transfer path can skip "
-                "the per-transfer all_pinned() scan."
-            )
-            self._pinned_check_warned = True
-        assert tensor.is_pinned(), (
-            "ScratchPool._create_tensor: tensor is not pinned "
-            "(pin_memory=True did not take effect); the DSA backend requires "
-            "pinned host memory"
-        )
-
-        tensor_bytes = tensor.numel() * tensor.element_size()
-        self._total_bytes += tensor_bytes
-        self._total_tensors += 1
-
-        return tensor
-
-    @profile_func(lambda self, count, *_: f"(count={count})")
-    def allocate(
-        self, count: int, shape: Tuple[int, ...], dtype: torch.dtype
-    ) -> List[torch.Tensor]:
-        with self._lock:
-            key = self._get_pool_key(shape, dtype)
-            available_before = len(self._pools.get(key, []))
-
-            if key not in self._pools:
-                self._pools[key] = []
-                available = self._pools[key]
-
-                chunk_numel = 1
-                for dim in shape:
-                    chunk_numel *= dim
-                chunk_bytes = chunk_numel * torch.tensor([], dtype=dtype).element_size()
-                preallocate_bytes = int(self._cache_size_gb * 0.1 * 1024**3)
-                preallocate_count = max(preallocate_bytes // chunk_bytes, count)
-                preallocate_count = min(preallocate_count, self._min_create_count * 100)
-
-                max_alloc = envs.IAXL_PREALLOC_LIMIT
-                if max_alloc > 0:
-                    preallocate_count = min(preallocate_count, max_alloc)
-
-                logger.info(
-                    "ScratchPool: pre-allocating %d tensors for shape=%s, dtype=%s (%.2f MB)",
-                    preallocate_count,
-                    shape,
-                    dtype,
-                    preallocate_count * chunk_bytes / (1024**2),
-                )
-
-                for _ in range(preallocate_count):
-                    tensor = self._create_tensor(shape, dtype)
-                    available.append(tensor)
-            else:
-                available = self._pools[key]
-
-            tensors = []
-            available_count = len(available)
-
-            if available_count >= count:
-                tensors = available[-count:]
-                del available[-count:]
-            elif available_count > 0:
-                tensors = available[:]
-                available.clear()
-                need_count = count - available_count
-
-                create_count = max(need_count, self._min_create_count)
-                for _ in range(create_count):
-                    available.append(self._create_tensor(shape, dtype))
-
-                tensors.extend(available[:need_count])
-                del available[:need_count]
-            else:
-                create_count = max(count, self._min_create_count)
-                for _ in range(create_count):
-                    available.append(self._create_tensor(shape, dtype))
-
-                tensors = available[:count]
-                del available[:count]
-
-            self._allocate_count += count
-
-            if self._debug:
-                created_count = count - min(available_before, count)
-                available_after = len(available)
-                in_flight = self._allocate_count - self._release_count
-                logger.info(
-                    "ScratchPool.allocate: key=%s, requested=%d, created=%d, available: %d -> %d, in_flight=%d",
-                    key,
-                    count,
-                    created_count,
-                    available_before,
-                    available_after,
-                    in_flight,
-                )
-
-            return tensors
-
-    @profile_func(lambda self, tensors, *_: f"(count={len(tensors)})")
     def release(self, tensors: List[torch.Tensor]):
-        with self._lock:
-            first = tensors[0]
-            key = self._get_pool_key(tuple(first.shape), first.dtype)
+        self._free.extend(t.block_idx for t in tensors)  # type: ignore[attr-defined]
+        self._release_count += len(tensors)
 
-            assert key in self._pools, (
-                f"ScratchPool.release: unknown key={key} (shape={first.shape}, dtype={first.dtype})"
-            )
+    def available_count(self, shape: Optional[Sequence[int]] = None, dtype: Optional[torch.dtype] = None) -> int:
+        return len(self._free)
 
-            available_before = len(self._pools[key])
-            self._pools[key].extend(tensors)
-            available_after = len(self._pools[key])
-
-            self._release_count += len(tensors)
-
-            if self._debug:
-                in_flight = self._allocate_count - self._release_count
-                logger.info(
-                    "ScratchPool.release: key=%s, released=%d, available: %d -> %d, in_flight=%d",
-                    key,
-                    len(tensors),
-                    available_before,
-                    available_after,
-                    in_flight,
-                )
-
-    def available_count(
-        self, shape: Tuple[int, ...] = None, dtype: torch.dtype = None
-    ) -> int:
-        with self._lock:
-            if shape is not None and dtype is not None:
-                key = self._get_pool_key(shape, dtype)
-                return len(self._pools.get(key, []))
-            else:
-                return sum(len(p) for p in self._pools.values())
-
-    def total_count(
-        self, shape: Tuple[int, ...] = None, dtype: torch.dtype = None
-    ) -> int:
-        with self._lock:
-            return self._total_tensors
+    def total_count(self, shape: Optional[Sequence[int]] = None, dtype: Optional[torch.dtype] = None) -> int:
+        return len(self._blocks)
 
     def total_bytes(self) -> int:
-        with self._lock:
-            return self._total_bytes
+        return self.pool.nbytes
 
     def status(self) -> str:
-        with self._lock:
-            total_available = sum(len(p) for p in self._pools.values())
-            in_use = self._allocate_count - self._release_count
-            lines = [
-                f"ScratchPool: {self._total_tensors} created, {total_available} available, {in_use} in-use, alloc/release={self._allocate_count}/{self._release_count}, {self._total_bytes / (1024**2):.2f} MB"
-            ]
-            for key, available in self._pools.items():
-                shape, dtype = key
-                lines.append(f"  {shape} {dtype}: {len(available)} available")
-            return "\n".join(lines)
+        free, in_use = len(self._free), self._allocate_count - self._release_count
+        return (f"ScratchPool: {len(self._blocks)} blocks {self.block_shape} {self.dtype}, "
+                f"{free} available, {in_use} in-use, alloc/release={self._allocate_count}/{self._release_count}, "
+                f"{self.pool.nbytes / 2**20:.2f} MB")
