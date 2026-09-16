@@ -20,6 +20,8 @@ from typing import Callable, Dict, List, Set
 import numpy as np
 import torch
 
+from ..utils import cuda_available
+
 logger = logging.getLogger(__name__)
 
 CTRL_BYTES = 4 << 20
@@ -164,7 +166,7 @@ class KVStoreService:
 
     def __init__(self, xfer, role: str, rank: int = 0, tp_size: int = 1):
         self.xfer, self.role, self.rank, self.tp_size = xfer, role, rank, tp_size
-        self.ctrl = _ctrl_buffer(pin=torch.cuda.is_available())
+        self.ctrl = _ctrl_buffer(pin=cuda_available())
         self.ctrl_np = self.ctrl.numpy()
         xfer.register_memory(self.ctrl)
         self.kvstore = None

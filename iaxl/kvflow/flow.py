@@ -19,6 +19,7 @@ from ..torch_ext import Record
 from ..torch_ext import Context, GpuTransferDirection
 from ..torch_ext import Mem, Storage
 from .. import torch_ext as _iqt
+from ..utils import cuda_available
 from .scratch_pool import ScratchPool
 from ..remote_pool.remote_tensor import RemoteTensor
 
@@ -29,7 +30,7 @@ stream_sync_on_get = envs.IAXL_CACHE_STREAM_SYNC_ON_GET
 
 
 def get_accelerator_device() -> str:
-    if torch.cuda.is_available():
+    if cuda_available():
         return "cuda"
     elif torch.xpu.is_available():
         return "xpu"
