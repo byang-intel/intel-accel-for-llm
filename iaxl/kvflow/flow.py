@@ -20,7 +20,7 @@ from ..torch_ext import Context, GpuTransferDirection
 from ..torch_ext import Mem, Storage
 from .. import torch_ext as _iqt
 from .scratch_pool import ScratchPool
-from .remote_tensor import RemoteTensor
+from ..remote_pool.remote_tensor import RemoteTensor
 
 logger = logging.getLogger(__name__)
 

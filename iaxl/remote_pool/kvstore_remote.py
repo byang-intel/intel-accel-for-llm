@@ -1,10 +1,10 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Client-side KVStore shell: same interface as `iaxl.kvstore.KVStore`, all work
-forwarded to the remote_pool daemon over RPC. The daemon moves KV blocks itself
-(RDMA READ for put, RDMA WRITE for get); this side only registers the kv_caches
-and tracks per-job completion pushed back by the daemon."""
+"""Client-side KVStore shell: same interface as `iaxl.kvstore.KVStoreLocal`, all
+work forwarded to the remote_pool daemon over RPC. The daemon moves KV blocks
+itself (RDMA READ for put, RDMA WRITE for get); this side only registers the
+kv_caches and tracks per-job completion pushed back by the daemon."""
 
 import logging
 from dataclasses import dataclass
@@ -13,9 +13,9 @@ from typing import Dict, List, Optional
 import torch
 
 from ..envs import envs
-from ..remote_pool import rpc
-from ..remote_pool.nixl_impl import rdma_xfer
-from ..remote_pool.rpc import RpcChannel, rank_port
+from . import rpc
+from .nixl_impl import rdma_xfer
+from .rpc import RpcChannel, rank_port
 
 logger = logging.getLogger(__name__)
 

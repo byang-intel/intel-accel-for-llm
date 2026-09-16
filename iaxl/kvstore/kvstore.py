@@ -8,7 +8,7 @@ from typing import Dict, List, Mapping, Optional, TYPE_CHECKING, Union
 import psutil
 from ..envs import envs
 from ..kvflow import KVFlow, Task, get_accelerator_device
-from ..kvflow.remote_tensor import RemoteTensor
+from ..remote_pool.remote_tensor import RemoteTensor
 from ..utils.profiler import (
     profile_scope,
     profile_cross_scope,
@@ -325,7 +325,7 @@ class KVStoreLocal:
 if TYPE_CHECKING:  # the two shells share one interface; pick the local one for typing
     KVStore = KVStoreLocal
 elif envs.IAXL_RDMA_ENABLE:
-    from .kvstore_remote import KVStoreRemote
+    from ..remote_pool.kvstore_remote import KVStoreRemote
 
     KVStore = KVStoreRemote
 else:

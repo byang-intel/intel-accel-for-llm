@@ -190,8 +190,9 @@ class KVStoreService:
 
     def _register_kv_caches(self, peer, payload):
         from iaxl import torch_ext
-        from iaxl.kvflow.remote_tensor import RemoteTensor
         from iaxl.kvstore import KVStoreLocal
+
+        from .remote_tensor import RemoteTensor
 
         req = unpack_json(payload)
         self._check_topology(req)
