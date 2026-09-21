@@ -83,10 +83,11 @@ def worker(rank, tp_size, gpu, argv, barrier, deadline, queue) -> None:
                 group = [per_rank[r][index] for r in range(tp_size)]
                 times = [r.milliseconds for r in group]
                 rank_bytes = sum(r.total_bytes for r in group) // tp_size
+                # Harmonic mean of the times, so GB/s is the plain mean of the ranks'.
                 average = bench.Result(
                     result.method,
                     result.direction,
-                    sum(times) / tp_size,
+                    tp_size / sum(1 / t for t in times),
                     rank_bytes,
                     all(r.valid for r in group),
                 )
