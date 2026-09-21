@@ -70,6 +70,16 @@ def parse_sizes(value: str) -> list[int]:
     return [parse_size(item) for item in value.split(",")]
 
 
+def parse_methods(value: str) -> list[str]:
+    names = [item.strip() for item in value.split(",") if item.strip()]
+    unknown = [name for name in names if name not in METHODS]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"invalid choice: {', '.join(unknown)} (choose from {', '.join(METHODS)})"
+        )
+    return names
+
+
 def format_size(size: int) -> str:
     if size >= 1 << 20:
         return f"{size / (1 << 20):g}M"
@@ -405,10 +415,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=tuple(METHODS),
-        default=list(METHODS),
+        type=parse_methods,
         metavar="NAME",
-        help=f"transfer methods to run: {', '.join(METHODS)}",
+        help=f"transfer methods to run, space or comma separated: {', '.join(METHODS)}",
     )
     parser.add_argument("--block", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=1)
@@ -454,6 +463,7 @@ def parse_args(
     args = parser.parse_args(argv)
     if isinstance(args.frag_sizes, str):
         args.frag_sizes = parse_sizes(args.frag_sizes)
+    args.methods = [name for group in args.methods for name in group] if args.methods else list(METHODS)
     if not torch.cuda.is_available():
         parser.error("CUDA is not available")
 #    if os.environ.get("IAXL_DSA_GD_ENABLE", "0").lower() not in ("1", "true", "yes", "on"):
