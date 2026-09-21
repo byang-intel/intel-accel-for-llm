@@ -41,11 +41,20 @@ def worker(rank, tp_size, gpu, argv, barrier, deadline, queue) -> None:
 
     logger.info("Bound rank %d to GPU %s (%s)", rank, gpu, torch.cuda.get_device_name(0))
 
+    late = [0, 0.0]  # missed starts, worst lateness in ms
+
     def sync() -> None:
+        # The first barrier waits for every rank to finish the previous iteration, so
+        # the deadline only has to cover the second barrier's wake-up jitter.
+        barrier.wait()
         if rank == 0:
             deadline.value = time.monotonic() + SPIN_SLACK_S
         barrier.wait()
         target = deadline.value
+        now = time.monotonic()
+        if now > target:
+            late[0] += 1
+            late[1] = max(late[1], (now - target) * 1000)
         while time.monotonic() < target:
             pass
 
@@ -57,43 +66,53 @@ def worker(rank, tp_size, gpu, argv, barrier, deadline, queue) -> None:
         args.flamegraph = ""
     bench.setup(args)
 
-    if rank != 0:
-        bench.run_all(args, lambda frag_bytes, results: queue.put((rank, frag_bytes, results)))
-        return
+    try:
+        if rank != 0:
+            bench.run_all(args, lambda frag_bytes, results: queue.put((rank, frag_bytes, results)))
+            return
 
-    aggregated: dict[str, dict[int, list[bench.Result]]] = {}
+        aggregated: dict[str, dict[int, list[bench.Result]]] = {}
 
-    def on_fragment(frag_bytes: int, results: list[bench.Result]) -> None:
-        per_rank = {0: results}
-        while len(per_rank) < tp_size:
-            other_rank, other_frag, other_results = queue.get()
-            assert other_frag == frag_bytes, "ranks out of step"
-            per_rank[other_rank] = other_results
-        for index, result in enumerate(results):
-            group = [per_rank[r][index] for r in range(tp_size)]
-            times = [r.milliseconds for r in group]
-            rank_bytes = sum(r.total_bytes for r in group) // tp_size
-            average = bench.Result(
-                result.method,
-                result.direction,
-                sum(times) / tp_size,
-                rank_bytes,
-                all(r.valid for r in group),
+        def on_fragment(frag_bytes: int, results: list[bench.Result]) -> None:
+            per_rank = {0: results}
+            while len(per_rank) < tp_size:
+                other_rank, other_frag, other_results = queue.get()
+                assert other_frag == frag_bytes, "ranks out of step"
+                per_rank[other_rank] = other_results
+            for index, result in enumerate(results):
+                group = [per_rank[r][index] for r in range(tp_size)]
+                times = [r.milliseconds for r in group]
+                rank_bytes = sum(r.total_bytes for r in group) // tp_size
+                average = bench.Result(
+                    result.method,
+                    result.direction,
+                    sum(times) / tp_size,
+                    rank_bytes,
+                    all(r.valid for r in group),
+                )
+                series = [
+                    average,
+                    # Fastest / slowest rank, i.e. the shortest / longest time.
+                    bench.Result(result.method, result.direction, min(times), rank_bytes, True, "max"),
+                    bench.Result(result.method, result.direction, max(times), rank_bytes, True, "min"),
+                ]
+                aggregated.setdefault(result.direction, {}).setdefault(frag_bytes, []).extend(series)
+                ranks = " ".join(f"{r.gbps:.2f}" for r in group)
+                bench.print_result(frag_bytes, average, f"  [{ranks}]")
+
+        bench.print_header()
+        print(f"Average per rank over {tp_size} ranks; per-rank GB/s in brackets")
+        bench.run_all(args, on_fragment)
+        bench.finish(args, aggregated)
+    finally:
+        if late[0]:
+            logger.warning(
+                "rank %d started late %d times (worst %.2f ms); results are less "
+                "aligned than intended, raise SPIN_SLACK_S",
+                rank,
+                late[0],
+                late[1],
             )
-            series = [
-                average,
-                # Fastest / slowest rank, i.e. the shortest / longest time.
-                bench.Result(result.method, result.direction, min(times), rank_bytes, True, "max"),
-                bench.Result(result.method, result.direction, max(times), rank_bytes, True, "min"),
-            ]
-            aggregated.setdefault(result.direction, {}).setdefault(frag_bytes, []).extend(series)
-            ranks = " ".join(f"{r.gbps:.2f}" for r in group)
-            bench.print_result(frag_bytes, average, f"  [{ranks}]")
-
-    bench.print_header()
-    print(f"Average per rank over {tp_size} ranks; per-rank GB/s in brackets")
-    bench.run_all(args, on_fragment)
-    bench.finish(args, aggregated)
 
 
 def main() -> None:
