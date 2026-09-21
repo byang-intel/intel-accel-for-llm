@@ -10,6 +10,8 @@ Example:
 """
 
 import argparse
+import ctypes
+import mmap
 import os
 import time
 from dataclasses import dataclass
@@ -43,7 +45,47 @@ METHOD_COLORS = {
     "CUDA Kernel": "#2ca02c",
     "IAXL DSA": "#1f77b4",
 }
+HUGE_PAGE_BYTES = 2 << 20
+MAP_HUGETLB = 0x40000
 RECORDER: PerfRecorder | None = None
+_HUGE_BUFFERS: dict[int, mmap.mmap] = {}
+
+
+def alloc_pinned(elements: int, hugepage: bool) -> torch.Tensor:
+    """Allocate page-locked host memory, optionally backed by explicit 2M hugetlb pages."""
+    if not hugepage:
+        return torch.empty(elements, dtype=torch.int16, pin_memory=True)
+
+    nbytes = elements * 2
+    pages = -(-nbytes // HUGE_PAGE_BYTES)
+    try:
+        buffer = mmap.mmap(
+            -1,
+            pages * HUGE_PAGE_BYTES,
+            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_HUGETLB,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            f"hugetlb mmap of {pages} x 2M pages failed ({error}); reserve them on the "
+            "bound NUMA node first, e.g. 'echo 512 > /sys/devices/system/node/node0/"
+            "hugepages/hugepages-2048kB/nr_hugepages'"
+        ) from error
+    base = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
+    tensor = torch.frombuffer(buffer, dtype=torch.int16, count=elements)
+    tensor.zero_()  # fault the pages in before pinning
+    status = cuda_runtime.cudaHostRegister(
+        base, nbytes, cuda_runtime.cudaHostRegisterDefault
+    )[0]
+    if status != cuda_runtime.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaHostRegister failed: {status}")
+    _HUGE_BUFFERS[tensor.data_ptr()] = buffer
+    return tensor
+
+
+def free_pinned(tensor: torch.Tensor) -> None:
+    if _HUGE_BUFFERS.pop(tensor.data_ptr(), None) is not None:
+        cuda_runtime.cudaHostUnregister(tensor.data_ptr())
 
 
 def parse_size(value: str) -> int:
@@ -197,14 +239,14 @@ def measure(
     return best
 
 
-def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
+def run(frag_bytes: int, args: argparse.Namespace, host_pool: torch.Tensor) -> list[Result]:
     total_target = int(args.total_gib * (1 << 30))
     fragments = max(1, total_target // frag_bytes)
     frag_elements = frag_bytes // 2
     total_bytes = fragments * frag_bytes
     elements = fragments * frag_elements
 
-    source = torch.randint(-32768, 32767, (elements,), dtype=torch.int16, pin_memory=True)
+    source = torch.randint(-32768, 32767, (elements,), dtype=torch.int16)
     permutation = torch.randperm(fragments)
     src_offsets = torch.arange(fragments, dtype=torch.int64) * frag_elements
     dst_offsets = permutation * frag_elements
@@ -221,7 +263,9 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
     for direction in directions:
         h2d = direction == "H2D"
         label = (direction, format_size(frag_bytes))
-        host = source.clone().pin_memory()
+        host = host_pool[:elements]
+        host.copy_(source)
+        host_fragments = host.view(fragments, frag_elements)
         gpu = torch.empty(elements, dtype=torch.int16, device="cuda")
         if not h2d:
             gpu.copy_(source)
@@ -318,12 +362,11 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
 
         if "iaxl" in args.methods:
             if h2d:
-                cpu_tensors = list(source_fragments.unbind())
+                cpu_tensors = list(host_fragments.unbind())
                 iaxl_copier = SliceCopier(
                     cpu_tensors, 0, dst_indices, out=gpu.view(fragments, frag_elements)
                 )
             else:
-                host_fragments = host.view(fragments, frag_elements)
                 cpu_tensors = [host_fragments[index] for index in dst_indices]
                 iaxl_copier = SliceCopier(
                     gpu.view(fragments, frag_elements), 0, src_indices, out=cpu_tensors
@@ -401,6 +444,12 @@ def main() -> None:
         metavar="NAME",
         help=f"transfer methods to run: {', '.join(METHODS)}",
     )
+    parser.add_argument(
+        "--hugepage",
+        action="store_true",
+        help="back host buffers with explicit 2M hugetlb pages (needs vm.nr_hugepages) "
+        "instead of torch pinned memory",
+    )
     parser.add_argument("--block", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=3)
@@ -454,8 +503,11 @@ def main() -> None:
         )
     print(f"{'Direction':9} {'Fragment':>10} {'Method':24} {'ms':>10} {'GB/s':>10} Check")
     all_results: dict[str, dict[int, list[Result]]] = {}
+    # One host buffer is reused for every fragment size so hugetlb pages are mapped once.
+    pool_bytes = max(int(args.total_gib * (1 << 30)), max(args.frag_sizes))
+    host_pool = alloc_pinned(pool_bytes // 2, args.hugepage)
     for frag_bytes in args.frag_sizes:
-        fragment_results = run(frag_bytes, args)
+        fragment_results = run(frag_bytes, args, host_pool)
         for result in fragment_results:
             all_results.setdefault(result.direction, {}).setdefault(frag_bytes, []).append(result)
             print(
@@ -463,6 +515,7 @@ def main() -> None:
                 f"{result.method:24} {result.milliseconds:10.3f} "
                 f"{result.gbps:10.2f} {'PASS' if result.valid else 'FAIL'}"
             )
+    free_pinned(host_pool)
     if args.plot:
         plot_results(all_results, args.frag_sizes, output_path(args.output_dir, args.plot))
     if RECORDER is not None:
