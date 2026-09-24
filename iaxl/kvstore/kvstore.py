@@ -86,10 +86,8 @@ class KVStoreLocal:
             self.kvcache_shape = None
             self.block_shape = None
 
-        if self.has_only_mode:
-            final_persist_dir = f"{model_name}_rank0"
-        else:
-            final_persist_dir = f"{model_name}_rank{rank}"
+        # Cache directory keyed by the caller-supplied rank (KVStore is DP-agnostic).
+        final_persist_dir = f"{model_name}_rank{rank}"
 
         if self.has_only_mode:
             pool_size_gb = 0.0

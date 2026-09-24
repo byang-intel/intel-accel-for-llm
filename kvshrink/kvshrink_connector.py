@@ -14,7 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.distributed.parallel_state import (
-    get_world_group,
+    get_tensor_model_parallel_rank,
     model_parallel_is_initialized,
 )
 import vllm.envs as envs
@@ -110,7 +110,27 @@ class KVShrinkConnector(KVConnectorBase_V1):
         )
         self.use_mla = self.model_config.use_mla
         self.vllm_device = vllm_config.device_config.device_type
-        self.rank = get_world_group().rank if model_parallel_is_initialized() else 0
+        parallel_config = vllm_config.parallel_config
+        # data_parallel_index, not data_parallel_rank (vLLM resets the latter
+        # to 0 for dense models).
+        self.dp_rank = parallel_config.data_parallel_index
+        if self.model_config.is_moe:
+            self.dp_size = parallel_config.data_parallel_size
+        else:
+            self.dp_size = int(os.environ.get("DP_SIZE", "1"))
+            logger.warning(
+                "Dense model: reading DP size from the DP_SIZE env var (%d) "
+                "because vLLM resets data_parallel_size to 1 for dense models.",
+                self.dp_size,
+            )
+        self.tp_rank = (
+            get_tensor_model_parallel_rank()
+            if model_parallel_is_initialized()
+            else 0
+        )
+        # Globally-unique worker index / total worker count: KVStore/CPU/port identity.
+        self.global_rank = self.dp_rank * self.tp_size + self.tp_rank
+        self.global_size = self.dp_size * self.tp_size
 
         self._req_states: dict[ReqId, ReqState] = {}
         self._reqs_to_load = RequestMetadata()
@@ -138,9 +158,14 @@ class KVShrinkConnector(KVConnectorBase_V1):
         )
 
         if role == KVConnectorRole.SCHEDULER:
+            # Scheduler store reads its DP group's tp0; offset mgmt ports by DP
+            # group so DP schedulers on one host don't clash.
+            iaxl_envs.IAXL_API_CONTROLLER_PORT += self.dp_rank
+            iaxl_envs.IAXL_API_WORKER_BASE_PORT += self.dp_rank * self.tp_size
             self.kvstore: Optional[KVStore] = KVStore(
                 model_name=os.path.basename(self.model_config.model),
                 layer_names=[str(index) for index in range(self.num_layers)],
+                rank=self.dp_rank * self.tp_size,
                 tp_size=self.tp_size,
             )
         else:
@@ -152,10 +177,12 @@ class KVShrinkConnector(KVConnectorBase_V1):
     def _bind_cpu_affinity(self) -> None:
         if self.vllm_device == "cpu":
             return
-        bind_cpu_affinity(self.rank, self.tp_size, envs.VLLM_CPU_OMP_THREADS_BIND)
+        bind_cpu_affinity(
+            self.global_rank, self.global_size, envs.VLLM_CPU_OMP_THREADS_BIND
+        )
 
     def _bind_intel_accel(self) -> None:
-        bind_intel_accel(self.rank)
+        bind_intel_accel(self.global_rank)
 
     def _store(self) -> KVStore:
         if self.kvstore is None:
@@ -338,7 +365,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
             model_name=os.path.basename(self.model_config.model),
             block_dim=block_dim,
             kv_caches=kv_caches,
-            rank=self.rank,
+            rank=self.global_rank,
             tp_size=self.tp_size,
         )
         logger.info(
