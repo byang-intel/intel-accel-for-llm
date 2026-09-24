@@ -12,6 +12,7 @@ Example:
 import argparse
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,7 +44,11 @@ METHOD_COLORS = {
     "CUDA Kernel": "#2ca02c",
     "IAXL DSA": "#1f77b4",
 }
+# Same color per method; the line style tells the variants apart.
+VARIANT_STYLES = {"": ("-", "o"), "max": ("--", None), "min": (":", None)}
 RECORDER: PerfRecorder | None = None
+# Called before every timed iteration; multi-rank runs use it to align all ranks.
+SYNC: Callable[[], None] | None = None
 
 
 def parse_size(value: str) -> int:
@@ -63,6 +68,16 @@ def parse_size(value: str) -> int:
 
 def parse_sizes(value: str) -> list[int]:
     return [parse_size(item) for item in value.split(",")]
+
+
+def parse_methods(value: str) -> list[str]:
+    names = [item.strip() for item in value.split(",") if item.strip()]
+    unknown = [name for name in names if name not in METHODS]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"invalid choice: {', '.join(unknown)} (choose from {', '.join(METHODS)})"
+        )
+    return names
 
 
 def format_size(size: int) -> str:
@@ -156,6 +171,7 @@ class Result:
     milliseconds: float
     total_bytes: int
     valid: bool
+    variant: str = ""  # "" plots as a solid line; "min"/"max" as dotted/dashed
 
     @property
     def gbps(self) -> float:
@@ -179,6 +195,8 @@ def measure(
         RECORDER.start(label)
     best = float("inf")
     for _ in range(iterations):
+        if SYNC is not None:
+            SYNC()
         if cuda_timing:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
@@ -354,20 +372,22 @@ def plot_results(
         by_fragment = results[direction]
         methods = list(METHOD_COLORS)
         for method in methods:
-            points = [
-                (size, result.gbps)
-                for size in frag_sizes
-                for result in by_fragment.get(size, [])
-                if result.method == method
-            ]
-            if points:
-                axis.plot(
-                    [point[0] for point in points],
-                    [point[1] for point in points],
-                    marker="o",
-                    color=METHOD_COLORS[method],
-                    label=method,
-                )
+            for variant, (style, marker) in VARIANT_STYLES.items():
+                points = [
+                    (size, result.gbps)
+                    for size in frag_sizes
+                    for result in by_fragment.get(size, [])
+                    if result.method == method and result.variant == variant
+                ]
+                if points:
+                    axis.plot(
+                        [point[0] for point in points],
+                        [point[1] for point in points],
+                        marker=marker,
+                        linestyle=style,
+                        color=METHOD_COLORS[method],
+                        label=f"{method} {variant}".strip(),
+                    )
 
         axis.axvspan(4 << 10, 64 << 10, color="gold", alpha=0.15, label="KV <= 64K")
         axis.set_xscale("log", base=2)
@@ -385,8 +405,7 @@ def plot_results(
     print(f"Plot saved to {path}")
 
 
-def main() -> None:
-    global RECORDER
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Compare fragmented H2D/D2H copies using CUDA, Triton, and IAXL DSA."
     )
@@ -396,10 +415,9 @@ def main() -> None:
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=tuple(METHODS),
-        default=list(METHODS),
+        type=parse_methods,
         metavar="NAME",
-        help=f"transfer methods to run: {', '.join(METHODS)}",
+        help=f"transfer methods to run, space or comma separated: {', '.join(METHODS)}",
     )
     parser.add_argument("--block", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=1)
@@ -436,14 +454,25 @@ def main() -> None:
         default="fp",
         help="perf call-graph unwinding mode",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(
+    parser: argparse.ArgumentParser, argv: list[str] | None = None
+) -> argparse.Namespace:
+    args = parser.parse_args(argv)
     if isinstance(args.frag_sizes, str):
         args.frag_sizes = parse_sizes(args.frag_sizes)
+    args.methods = [name for group in args.methods for name in group] if args.methods else list(METHODS)
     if not torch.cuda.is_available():
         parser.error("CUDA is not available")
 #    if os.environ.get("IAXL_DSA_GD_ENABLE", "0").lower() not in ("1", "true", "yes", "on"):
 #        parser.error("set IAXL_DSA_GD_ENABLE=1 to benchmark IAXL DSA")
+    return args
 
+
+def setup(args: argparse.Namespace) -> None:
+    global RECORDER
     torch.manual_seed(42)
     os.makedirs(args.output_dir, exist_ok=True)
     if args.flamegraph:
@@ -452,17 +481,33 @@ def main() -> None:
             frequency=args.flamegraph_freq,
             call_graph=args.flamegraph_call_graph,
         )
+
+
+def print_header() -> None:
     print(f"{'Direction':9} {'Fragment':>10} {'Method':24} {'ms':>10} {'GB/s':>10} Check")
+
+
+def print_result(frag_bytes: int, result: Result, extra: str = "") -> None:
+    print(
+        f"{result.direction:9} {frag_bytes / 1024:9g}K "
+        f"{result.method:24} {result.milliseconds:10.3f} "
+        f"{result.gbps:10.2f} {'PASS' if result.valid else 'FAIL'}{extra}"
+    )
+
+
+def run_all(
+    args: argparse.Namespace, on_fragment: Callable[[int, list[Result]], None]
+) -> dict[str, dict[int, list[Result]]]:
     all_results: dict[str, dict[int, list[Result]]] = {}
     for frag_bytes in args.frag_sizes:
         fragment_results = run(frag_bytes, args)
         for result in fragment_results:
             all_results.setdefault(result.direction, {}).setdefault(frag_bytes, []).append(result)
-            print(
-                f"{result.direction:9} {frag_bytes / 1024:9g}K "
-                f"{result.method:24} {result.milliseconds:10.3f} "
-                f"{result.gbps:10.2f} {'PASS' if result.valid else 'FAIL'}"
-            )
+        on_fragment(frag_bytes, fragment_results)
+    return all_results
+
+
+def finish(args: argparse.Namespace, all_results: dict[str, dict[int, list[Result]]]) -> None:
     if args.plot:
         plot_results(all_results, args.frag_sizes, output_path(args.output_dir, args.plot))
     if RECORDER is not None:
@@ -473,6 +518,19 @@ def main() -> None:
         print(f"Flame graph saved to {svg} ({RECORDER.samples} samples)")
         print(f"Folded stacks saved to {folded}")
         print(f"perf data kept at {RECORDER.data_path}")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parse_args(parser)
+    setup(args)
+    print_header()
+
+    def on_fragment(frag_bytes: int, results: list[Result]) -> None:
+        for result in results:
+            print_result(frag_bytes, result)
+
+    finish(args, run_all(args, on_fragment))
 
 
 if __name__ == "__main__":
