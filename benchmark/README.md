@@ -9,22 +9,27 @@ Run the following commands from the repository root in the configured developmen
 Measures KVStore PUT/GET bandwidth, compression ratio, and compression/decompression throughput.
 
 ```bash
-bash benchmark/kvstore/kvstore_benchmark.sh
+bash benchmark/kvstore/kvstore_benchmark.sh --qat
 ```
 
-Enable DSA or Nsight Systems profiling with `--dsa` or `--nsys`:
+The launcher mirrors vLLM: the main process is the scheduler and drives one worker process per TP rank (`--ranks N`, default 1). Rank `r` uses GPU `r` and is bound to its own CPUs / QAT / DSA from `setvars.sh` (`VLLM_CPU_OMP_THREADS_BIND`, `KVSHRINK_QAT_DEVICES`, `KVSHRINK_DSA_DEVICES`), owns a `KVStore(rank=r)`, and all ranks start each timed step together. The report lists every rank plus a `Sum` row, followed by the aggregate where the wall time is the slowest rank's, like a TP forward pass.
+
+`--qat` and/or `--iaa` select the compression engines; with neither, compression is disabled (`IAXL_KV_COMPRESSION=0`) and a warning is printed. `--dsa` enables DSA gather/scatter and `--nsys` wraps the run in Nsight Systems:
 
 ```bash
-bash benchmark/kvstore/kvstore_benchmark.sh --dsa
-python3 benchmark/kvstore/kvstore_benchmark.py --shape 2 1024 16 4 128 --dtype bf16 --num-layers 32
+bash benchmark/kvstore/kvstore_benchmark.sh --ranks 2 --qat --iaa --dsa
+bash benchmark/kvstore/kvstore_benchmark.sh --qat --shape 2 1024 16 4 128 --dtype bf16 --num-layers 32
 ```
 
-By default the KV cache is filled by a real transformer prefill of `$MODEL`. The generated data is stored as `<model>_<dtype>.pt` under `--kv-data-dir` and reused whenever it matches the requested shape. `--dtype` selects `bf16`, `fp8_e4m3` (per-tensor k/v scale), or `int4` (symmetric group-wise, two 4-bit values per byte), matching vLLM's quantization. Use `--data-source mock` for synthetic data:
+By default the KV cache is filled by a real transformer prefill of `$MODEL`. The generated data is stored as `<model>_<dtype>.pt` under `--kv-data-dir` and reused whenever it matches the requested shape (rank 0 generates it, the other ranks reuse it). `--dtype` selects `bf16`, `fp8_e4m3` (per-tensor k/v scale), or `int4` (symmetric group-wise, two 4-bit values per byte), matching vLLM's quantization. Use `--data-source mock` for synthetic data:
 
 ```bash
-python3 benchmark/kvstore/kvstore_benchmark.py --dtype int4 \
+bash benchmark/kvstore/kvstore_benchmark.sh --qat --dtype int4 \
     --prompt-file /path/to/text.txt --model-seq-len 16384
+bash benchmark/kvstore/kvstore_benchmark.sh --ranks 2 --qat --data-source mock
 ```
+
+`kvstore_benchmark.py` can still be run directly for a plain single-process run without CPU / accelerator binding.
 
 ## Tensor Transfer
 
@@ -39,6 +44,8 @@ Use `--direction h2d` or `--direction d2h` to run a single direction, and `--met
 ```bash
 bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh --direction h2d --methods iaxl cuda
 ```
+
+`--ranks N` runs one process per TP rank (rank `r` on GPU `r`, bound like the KVStore benchmark) and reports the per-rank average.
 
 All generated files go to `/_data/tensor_xfer_benchmark`; change it with `--output-dir`.
 
