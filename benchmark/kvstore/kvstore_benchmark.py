@@ -7,8 +7,9 @@ import json
 import math
 import os
 import time
+import urllib.parse
 import urllib.request
-from typing import List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -74,7 +75,7 @@ def add_env_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark KVStore PUT/GET with generated or file-backed data.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -148,7 +149,7 @@ def parse_args() -> argparse.Namespace:
         help="KVStore REST endpoint for compression throughput metrics.",
     )
     add_env_arguments(parser)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     shape = tuple(args.kv_cache_shape)
     if shape[0] != 2:
         parser.error("the first --kv-cache-shape dimension must be 2 (key/value)")
@@ -434,133 +435,164 @@ def cache_status_rest(metrics_url: str) -> dict:
     return _rest_get_json(status_url)
 
 
-def run_benchmark(args: argparse.Namespace) -> bool:
-    if get_accelerator_device() != "cuda":
-        print("No CUDA device available; KVStore benchmark cannot run.")
-        return False
-
-    shape: Tuple[int, ...] = args.kv_cache_shape
-    store_shape = storage_shape(shape, args.dtype)
-    dtype = DTYPE_MAP[args.dtype]
-    num_layers = args.num_layers
-    cache_blocks = shape[BLOCK_DIM]
-
-    block_indices = list(range(0, cache_blocks, 2))
-    num_blocks = len(block_indices)
-    bytes_per_block = math.prod(store_shape) // cache_blocks * dtype.itemsize
-
-    total_blocks = num_blocks * num_layers
-    total_bytes = bytes_per_block * num_blocks * num_layers
-
-    layer_names = [str(i) for i in range(num_layers)]
-
-    print("=" * 80)
-    print("KVStore Benchmark")
-    print("=" * 80)
-    print(f"KV cache shape: {list(shape)} (one layer)")
-    print(f"Layers:         {num_layers}")
-    print(f"Blocks tested:  {num_blocks} (even indices, strided) x {num_layers} layers")
-    print(f"Dtype:          {args.dtype}")
-    if store_shape != shape:
-        print(f"Stored shape:   {list(store_shape)} ({dtype}, two int4 per byte)")
-    print(f"Data source:    {args.data_source}")
-    print(f"Transfer size:  {format_bytes(total_bytes)}")
-
+def build_kv_caches(
+    args: argparse.Namespace, layer_names: List[str]
+) -> Dict[str, torch.Tensor]:
+    shape = args.kv_cache_shape
     if args.data_source == "model":
         print(f"\nBuilding KV cache from {args.model}...")
         layers = load_or_generate_model_kv_cache(args, shape, args.dtype)
-        kv_caches = {
+        return {
             name: layers[i % len(layers)].to("cuda")
             for i, name in enumerate(layer_names)
         }
-        del layers
-    else:
-        if args.data_source == "file":
-            print(f"\nLoading KV cache from {args.data_file}...")
-            base = load_kv_cache_from_file(args.data_file, store_shape, dtype)
-        else:
-            print("\nGenerating mock KV cache data...")
-            base = generate_mock_kv_cache(shape, args.dtype)
-        kv_caches = {name: base.clone() for name in layer_names}
-        del base
-
-    index = torch.tensor(
-        [block_indices[0], block_indices[num_blocks // 2], block_indices[-1]],
-        device="cuda",
-    )
-    expected = {
-        name: tensor.index_select(BLOCK_DIM, index).clone()
-        for name, tensor in kv_caches.items()
-    }
-
-    block_hashes = make_block_hashes(num_blocks)
-
-    kvstore = KVStore(
-        model_name="kvstore_benchmark",
-        kv_caches=kv_caches,
-        block_dim=BLOCK_DIM,
-    )
-
-    cache_metrics_rest(args.metrics_url, "enable=1&reset=1")
-
-    print("\nWarming up...")
-    warmup_hashes = [f"warmup_{h}" for h in block_hashes]
-    warmup_put = kvstore.put(block_indices, warmup_hashes, description="warmup PUT")
-    if not kvstore.put_wait(warmup_put):
-        raise RuntimeError("warm-up PUT did not complete")
-    warmup_get = kvstore.get(block_indices, warmup_hashes, description="warmup GET")
-    if not kvstore.get_wait(warmup_get):
-        raise RuntimeError("warm-up GET did not complete")
-    torch.cuda.synchronize()
-
-    cache_metrics_rest(args.metrics_url, "reset=1")
-
-    torch.cuda.synchronize()
-    start = time.perf_counter()
-    with torch.cuda.nvtx.range("benchmark PUT"):
-        put_tasks = {}
-        for name in layer_names:
-            put_tasks.update(
-                kvstore.put(
-                    block_indices,
-                    block_hashes,
-                    layer_names=[name],
-                    description="benchmark PUT",
-                )
-            )
-        if not kvstore.put_wait(put_tasks):
-            raise RuntimeError("PUT did not complete")
-    put_time = time.perf_counter() - start
-
-    for tensor in kv_caches.values():
-        tensor.zero_()
-    torch.cuda.synchronize()
-
-    start = time.perf_counter()
-    with torch.cuda.nvtx.range("benchmark GET"):
-        get_tasks = kvstore.get(
-            block_indices, block_hashes, layer_names=None, description="benchmark GET"
+    if args.data_source == "file":
+        print(f"\nLoading KV cache from {args.data_file}...")
+        base = load_kv_cache_from_file(
+            args.data_file, storage_shape(shape, args.dtype), DTYPE_MAP[args.dtype]
         )
-        for name in layer_names:
-            if not kvstore.get_wait(get_tasks, layer_names=[name]):
-                raise RuntimeError("GET did not complete")
-    get_time = time.perf_counter() - start
+    else:
+        print("\nGenerating mock KV cache data...")
+        base = generate_mock_kv_cache(shape, args.dtype)
+    return {name: base.clone() for name in layer_names}
 
-    verified = all(
-        torch.equal(tensor.index_select(BLOCK_DIM, index), expected[name])
-        for name, tensor in kv_caches.items()
-    )
 
-    print("\nResults")
+class Benchmark:
+    """One rank's KV caches plus KVStore; the steps mirror vLLM's layer-wise PUT/GET."""
+
+    def __init__(self, args: argparse.Namespace, rank: int = 0, tp_size: int = 1):
+        self.args = args
+        self.rank = rank
+        self.tp_size = tp_size
+        self.shape: Tuple[int, ...] = args.kv_cache_shape
+        self.store_shape = storage_shape(self.shape, args.dtype)
+        self.dtype = DTYPE_MAP[args.dtype]
+        cache_blocks = self.shape[BLOCK_DIM]
+        self.block_indices = list(range(0, cache_blocks, 2))
+        self.num_blocks = len(self.block_indices)
+        bytes_per_block = math.prod(self.store_shape) // cache_blocks * self.dtype.itemsize
+        self.total_blocks = self.num_blocks * args.num_layers
+        self.total_bytes = bytes_per_block * self.total_blocks
+        self.layer_names = [str(i) for i in range(args.num_layers)]
+        self.block_hashes = make_block_hashes(self.num_blocks)
+
+    def print_config(self) -> None:
+        print("=" * 80)
+        print("KVStore Benchmark")
+        print("=" * 80)
+        print(f"KV cache shape: {list(self.shape)} (one layer)")
+        print(f"Layers:         {self.args.num_layers}")
+        print(
+            f"Blocks tested:  {self.num_blocks} (even indices, strided) "
+            f"x {self.args.num_layers} layers"
+        )
+        print(f"Dtype:          {self.args.dtype}")
+        if self.store_shape != self.shape:
+            print(f"Stored shape:   {list(self.store_shape)} ({self.dtype}, two int4 per byte)")
+        print(f"Data source:    {self.args.data_source}")
+        print(f"Transfer size:  {format_bytes(self.total_bytes)}")
+
+    def setup(self) -> None:
+        self.kv_caches = build_kv_caches(self.args, self.layer_names)
+        self.index = torch.tensor(
+            [
+                self.block_indices[0],
+                self.block_indices[self.num_blocks // 2],
+                self.block_indices[-1],
+            ],
+            device="cuda",
+        )
+        self.expected = {
+            name: tensor.index_select(BLOCK_DIM, self.index).clone()
+            for name, tensor in self.kv_caches.items()
+        }
+        self.kvstore = KVStore(
+            model_name="kvstore_benchmark",
+            kv_caches=self.kv_caches,
+            block_dim=BLOCK_DIM,
+            rank=self.rank,
+            tp_size=self.tp_size,
+        )
+
+    def metrics(self, **params) -> dict:
+        return cache_metrics_rest(self.args.metrics_url, urllib.parse.urlencode(params))
+
+    def status(self) -> dict:
+        return cache_status_rest(self.args.metrics_url)
+
+    def warmup(self) -> None:
+        self.metrics(enable=1, reset=1)
+        print("\nWarming up...")
+        warmup_hashes = [f"warmup_{h}" for h in self.block_hashes]
+        put = self.kvstore.put(self.block_indices, warmup_hashes, description="warmup PUT")
+        if not self.kvstore.put_wait(put):
+            raise RuntimeError("warm-up PUT did not complete")
+        get = self.kvstore.get(self.block_indices, warmup_hashes, description="warmup GET")
+        if not self.kvstore.get_wait(get):
+            raise RuntimeError("warm-up GET did not complete")
+        torch.cuda.synchronize()
+        self.metrics(reset=1)
+
+    def put(self) -> float:
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        with torch.cuda.nvtx.range("benchmark PUT"):
+            put_tasks = {}
+            for name in self.layer_names:
+                put_tasks.update(
+                    self.kvstore.put(
+                        self.block_indices,
+                        self.block_hashes,
+                        layer_names=[name],
+                        description="benchmark PUT",
+                    )
+                )
+            if not self.kvstore.put_wait(put_tasks):
+                raise RuntimeError("PUT did not complete")
+        return time.perf_counter() - start
+
+    def get(self) -> float:
+        for tensor in self.kv_caches.values():
+            tensor.zero_()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        with torch.cuda.nvtx.range("benchmark GET"):
+            get_tasks = self.kvstore.get(
+                self.block_indices,
+                self.block_hashes,
+                layer_names=None,
+                description="benchmark GET",
+            )
+            for name in self.layer_names:
+                if not self.kvstore.get_wait(get_tasks, layer_names=[name]):
+                    raise RuntimeError("GET did not complete")
+        return time.perf_counter() - start
+
+    def verify(self) -> bool:
+        return all(
+            torch.equal(tensor.index_select(BLOCK_DIM, self.index), self.expected[name])
+            for name, tensor in self.kv_caches.items()
+        )
+
+
+def print_report(
+    put_time: float,
+    get_time: float,
+    verified: bool,
+    status: dict,
+    metrics: dict,
+    total_blocks: int,
+    total_bytes: int,
+    title: str = "Results",
+) -> None:
+    print(f"\n{title}")
     print("-" * 80)
     print_result("PUT", put_time, total_blocks, total_bytes)
     print_result("GET", get_time, total_blocks, total_bytes)
     print(f"Verification: {'passed' if verified else 'FAILED'}")
-
-    status = cache_status_rest(args.metrics_url)
-    print(
-        f"Compression ratio: {status['compression_ratio (unzip/zip, higher=better)']:.3f}x"
-    )
+    ratio = status["compression_ratio (unzip/zip, higher=better)"]
+    saved_pct = (1 - 1 / ratio) * 100 if ratio else 0.0
+    print(f"Compression ratio: {ratio:.3f}x ({saved_pct:.1f}%)")
     print(
         f"Native cache size: {format_bytes(status['current_bytes'])} "
         f"({status['cache_entries']} chunks in {status['group_count']} groups)"
@@ -572,8 +604,6 @@ def run_benchmark(args: argparse.Namespace) -> bool:
         f"Compressed/uncompressed bytes: {format_bytes(status['total_zip_bytes'])} / "
         f"{format_bytes(status['total_unzip_bytes'])}"
     )
-
-    metrics = cache_metrics_rest(args.metrics_url)
     print(
         f"Compress throughput:   {metrics['compress_gbps']:.3f} GB/s "
         f"({format_bytes(metrics['compress_bytes'])} in {metrics['compress_ns'] / 1e6:.1f} ms)"
@@ -581,6 +611,29 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     print(
         f"Decompress throughput: {metrics['decompress_gbps']:.3f} GB/s "
         f"({format_bytes(metrics['decompress_bytes'])} in {metrics['decompress_ns'] / 1e6:.1f} ms)"
+    )
+
+
+def run_benchmark(args: argparse.Namespace) -> bool:
+    if get_accelerator_device() != "cuda":
+        print("No CUDA device available; KVStore benchmark cannot run.")
+        return False
+
+    bench = Benchmark(args)
+    bench.print_config()
+    bench.setup()
+    bench.warmup()
+    put_time = bench.put()
+    get_time = bench.get()
+    verified = bench.verify()
+    print_report(
+        put_time,
+        get_time,
+        verified,
+        bench.status(),
+        bench.metrics(),
+        bench.total_blocks,
+        bench.total_bytes,
     )
     return verified
 
