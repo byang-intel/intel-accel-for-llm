@@ -518,6 +518,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         },
         "Read accumulated compression/decompression throughput metrics (GB/s is decimal)");
 
+#if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
+    m.def("dsa_v1_register_mem", &kv_xfer::dsa_v1_register_mem,
+          "GDR-map a GPU region once for the DSA v1 backend (e.g. a whole kvcache tensor).",
+          py::arg("base"), py::arg("bytes"), py::call_guard<py::gil_scoped_release>());
+#endif
+
     m.def("rdma_init", &kv_xfer::rdma_init, py::arg("name"), py::arg("listen_port"),
           py::call_guard<py::gil_scoped_release>());
     m.def("rdma_wait_peer", &kv_xfer::rdma_wait_peer, py::arg("peer"), py::arg("timeout_s") = 60.0,
