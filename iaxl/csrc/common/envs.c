@@ -95,6 +95,7 @@ __attribute__((constructor(101))) void envs_init(void) {
 
     envs.IAXL_DSA_GD_ENABLE = env_bool("IAXL_DSA_GD_ENABLE", 0);
     envs.IAXL_DSA_GD_RESET_ON_DESTROY = env_bool("IAXL_DSA_GD_RESET_ON_DESTROY", 0);
+    envs.IAXL_DSA_V1_ENABLE = envs.IAXL_DSA_GD_ENABLE && env_bool("IAXL_DSA_V1_ENABLE", 0);
 
     envs.IAXL_DEBUG_LOG = env_bool("IAXL_DEBUG_LOG", 0);
     envs.IAXL_PROFILE_MODE = env_str("IAXL_PROFILE_MODE", "disabled");
@@ -121,7 +122,7 @@ __attribute__((constructor(101))) void envs_init(void) {
              "iaa_instances=%d cpu_zip_threads=%d "
              "omp_threads=%d cpus=%d "
                "compression=%s data_shuffle=%s lossy_trunc=%d dsa_gd=%s "
-               "dsa_gd_reset=%s "
+               "dsa_gd_reset=%s dsa_v1=%s "
                "profile=%s\n",
                envs.IAXL_QAT_ZIP_ENABLE ? "ON" : "OFF",
                envs.IAXL_IAA_ZIP_ENABLE ? "ON" : "OFF",
@@ -131,6 +132,7 @@ __attribute__((constructor(101))) void envs_init(void) {
                envs.IAXL_OMP_THREAD_NUM, cpus, envs.IAXL_KV_COMPRESSION ? "ON" : "OFF",
                envs.IAXL_KV_DATA_SHUFFLE ? "ON" : "OFF", envs.IAXL_KV_LOSSY_TRUNC,
                envs.IAXL_DSA_GD_ENABLE ? "ON" : "OFF",
-               envs.IAXL_DSA_GD_RESET_ON_DESTROY ? "ON" : "OFF", envs.IAXL_PROFILE_MODE);
+               envs.IAXL_DSA_GD_RESET_ON_DESTROY ? "ON" : "OFF",
+               envs.IAXL_DSA_V1_ENABLE ? "ON" : "OFF", envs.IAXL_PROFILE_MODE);
     }
 }
