@@ -99,7 +99,7 @@ for cmd in adf_ctl modprobe modinfo; do
 done
 
 PF_MODULES=()
-for m in qat_4xxx qat_420xx; do
+for m in qat_4xxx; do
     modinfo "$m" >/dev/null 2>&1 && PF_MODULES+=("$m")
 done
 if [[ ${#PF_MODULES[@]} -eq 0 ]]; then
