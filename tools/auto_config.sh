@@ -485,6 +485,10 @@ validate_omp_config() {
         echo "ERROR: IAXL_CPU_ZIP_THREADS must be a non-negative integer" >&2
         return 1
     fi
+    if ! [[ "$IAXL_ZIP_MAX_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: IAXL_ZIP_MAX_THREADS must be a positive integer" >&2
+        return 1
+    fi
     if ((IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS == 0)); then
         # No zip worker: KV blocks must be stored raw; OpenMP threads only do host copies.
         if env_truthy "$IAXL_KV_COMPRESSION"; then
@@ -520,5 +524,6 @@ validate_omp_config() {
         "  IAXL_IAA_INSTANCE_NUM=$IAXL_IAA_INSTANCE_NUM" \
         "  IAXL_CPU_ZIP_THREADS=$IAXL_CPU_ZIP_THREADS" \
         "  IAXL_RESERVED_CPU_NUM=$IAXL_RESERVED_CPU_NUM" \
-        "  IAXL_OMP_THREAD_NUM=$IAXL_OMP_THREAD_NUM"
+        "  IAXL_OMP_THREAD_NUM=$IAXL_OMP_THREAD_NUM" \
+        "  IAXL_ZIP_MAX_THREADS=$IAXL_ZIP_MAX_THREADS"
 }

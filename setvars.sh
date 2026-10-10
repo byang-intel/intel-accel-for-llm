@@ -135,6 +135,7 @@ fi
 export OMP_NUM_THREADS=$IAXL_OMP_THREAD_NUM
 export OMP_THREAD_LIMIT=$IAXL_OMP_THREAD_NUM
 export OMP_MAX_ACTIVE_LEVELS=2
+export IAXL_ZIP_MAX_THREADS=${IAXL_ZIP_MAX_THREADS:-$IAXL_OMP_THREAD_NUM} # Max threads polling zip workers (capped at the worker count; 1 = calling thread only, no OpenMP)
 validate_omp_config "$MIN_RANK_CPU_COUNT" || return 1 2>/dev/null || exit 1
 
 # ---- Intel DSA (host<->device copy accelerator, CUDA only) ------------------
