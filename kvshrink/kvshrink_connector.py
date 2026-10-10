@@ -19,7 +19,12 @@ from vllm.distributed.parallel_state import (
 )
 import vllm.envs as envs
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+    group_kernel_blocks,
+)
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -102,13 +107,13 @@ class KVShrinkConnector(KVConnectorBase_V1):
             kv_cache_config=kv_cache_config,
         )
         self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
         self.model_config = vllm_config.model_config
         self.block_size = vllm_config.cache_config.block_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.num_layers = self.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.use_mla = self.model_config.use_mla
         self.vllm_device = vllm_config.device_config.device_type
         parallel_config = vllm_config.parallel_config
         # data_parallel_index, not data_parallel_rank (vLLM resets the latter
@@ -333,6 +338,10 @@ class KVShrinkConnector(KVConnectorBase_V1):
             if block_ids and block_ids[0] and is_prefill:
                 self._add_request_to_save(req_id, block_ids[0])
 
+        # kvshrink loads asynchronously, but its start_load_kv only submits
+        # host-side work; running it before the forward keeps the 0.23-style
+        # placement (0.29 would otherwise defer it to post_forward).
+        scheduler_output.has_sync_kv_loads = True
         metadata = KVShrinkConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_save=self._reqs_to_save,
@@ -344,6 +353,55 @@ class KVShrinkConnector(KVConnectorBase_V1):
     ############################################################
     # Worker Side Methods
     ############################################################
+
+    def _view_as_blocks(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """View each layer's KV cache as contiguous ``(num_blocks, page)`` rows
+        per logical block, taken from the ``KVCacheConfig`` geometry."""
+        num_blocks = self.kv_cache_config.num_blocks
+        spec_by_layer: dict[str, Any] = {}
+        for group in self.kv_cache_config.kv_cache_groups:
+            specs = (
+                group.kv_cache_spec.kv_cache_specs
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else {}
+            )
+            for layer_name in group.layer_names:
+                spec_by_layer[layer_name] = specs.get(
+                    layer_name, group.kv_cache_spec
+                )
+
+        attn_dtype = next(
+            (
+                spec.dtype
+                for spec in spec_by_layer.values()
+                if isinstance(spec, AttentionSpec)
+            ),
+            None,
+        )
+        assert attn_dtype is not None
+
+        views: dict[str, torch.Tensor] = {}
+        for layer_name, cache in kv_caches.items():
+            spec = spec_by_layer[layer_name]
+            ref = group_kernel_blocks(cache, num_blocks)
+            page_bytes = spec.page_size_bytes
+            assert page_bytes % attn_dtype.itemsize == 0
+            views[layer_name] = torch.tensor(
+                [], dtype=attn_dtype, device=ref.device
+            ).set_(
+                ref.untyped_storage(),
+                ref.storage_offset(),
+                (num_blocks, page_bytes // attn_dtype.itemsize),
+                (
+                    ref.stride(0)
+                    if isinstance(spec, AttentionSpec)
+                    else page_bytes // attn_dtype.itemsize,
+                    1,
+                ),
+            )
+        return views
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if not kv_caches:
@@ -357,13 +415,13 @@ class KVShrinkConnector(KVConnectorBase_V1):
                     raise RuntimeError("FlashInfer is not supported")
                 break
 
+        kv_caches = self._view_as_blocks(kv_caches)
         first_kv_cache = next(iter(kv_caches.values()))
-        block_dim = 0 if self.use_mla or first_kv_cache.shape[1] == 2 else 1
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
-            block_dim=block_dim,
+            block_dim=0,
             kv_caches=kv_caches,
             rank=self.global_rank,
             tp_size=self.tp_size,
