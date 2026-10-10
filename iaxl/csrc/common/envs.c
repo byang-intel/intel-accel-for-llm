@@ -79,7 +79,7 @@ __attribute__((constructor(101))) void envs_init(void) {
                                        envs.IAXL_CPU_ZIP_THREADS);
     if (envs.IAXL_OMP_THREAD_NUM < 1)
         envs.IAXL_OMP_THREAD_NUM = 1;
-    envs.IAXL_ZIP_MAX_THREADS = env_int("IAXL_ZIP_MAX_THREADS", envs.IAXL_OMP_THREAD_NUM);
+    envs.IAXL_USE_OMP = env_bool("IAXL_USE_OMP", 1);
 
     envs.IAXL_KV_COMPRESSION = env_bool("IAXL_KV_COMPRESSION", 1);
     if (envs.IAXL_KV_COMPRESSION && !envs.IAXL_QAT_ZIP_ENABLE && !envs.IAXL_IAA_ZIP_ENABLE &&
@@ -120,7 +120,7 @@ __attribute__((constructor(101))) void envs_init(void) {
 
          printf("[iaxl] config: qat_zip=%s iaa_zip=%s cpu_zip=%s qat_instances=%d "
              "iaa_instances=%d cpu_zip_threads=%d "
-             "omp_threads=%d zip_max_threads=%d cpus=%d "
+             "omp_threads=%d use_omp=%s cpus=%d "
                "compression=%s data_shuffle=%s lossy_trunc=%d dsa_gd=%s "
                "dsa_gd_reset=%s "
                "profile=%s\n",
@@ -129,7 +129,7 @@ __attribute__((constructor(101))) void envs_init(void) {
                envs.IAXL_CPU_ZIP_ENABLE ? "ON" : "OFF", envs.IAXL_QAT_INSTANCE_NUM,
                envs.IAXL_IAA_INSTANCE_NUM,
                envs.IAXL_CPU_ZIP_THREADS,
-               envs.IAXL_OMP_THREAD_NUM, envs.IAXL_ZIP_MAX_THREADS, cpus,
+               envs.IAXL_OMP_THREAD_NUM, envs.IAXL_USE_OMP ? "ON" : "OFF", cpus,
                envs.IAXL_KV_COMPRESSION ? "ON" : "OFF",
                envs.IAXL_KV_DATA_SHUFFLE ? "ON" : "OFF", envs.IAXL_KV_LOSSY_TRUNC,
                envs.IAXL_DSA_GD_ENABLE ? "ON" : "OFF",
