@@ -69,6 +69,7 @@ sudo ./tools/install_gdr_driver.sh
 | 加速器 | `IAXL_DSA_GD_ENABLE` | `0` | 启用 Intel DSA + GDRCopy 传输（`0`/`1`） |
 | 压缩 | `IAXL_KV_COMPRESSION` | `1` | 对 KV cache 启用 DEFLATE 压缩（`0`/`1`） |
 | 压缩 | `IAXL_ZIP_LEVEL` | `1` | 所有压缩后端的压缩级别，取值 `1`（最快）到 `9`（压缩率最高）。QAT 和 CPU 直接使用该级别；IAA 硬件只支持 level 1，因此 IAA 忽略此配置。建议保持默认值 `1`：提高级别对 KV cache 压缩率的提升很有限，却会明显降低压缩速度 |
+| 压缩 | `IAXL_KV_DATA_SHUFFLE` | `1` | 压缩前对 BF16 数据做字节重排（`0`/`1`）。会稍微降低压缩性能，但可以提升压缩率和解压性能 |
 | vLLM | `MODEL` | `Qwen/Qwen3-32B` | Hugging Face 模型 ID 或本地模型路径 |
 | vLLM | `TP_SIZE` | `2` | 必须配置；Tensor Parallel worker 数量，CPU、QAT 和 DSA 资源将据此自动配置 |
 | vLLM | `DP_SIZE` | `1` | Data Parallel 组数；rank 总数 = `TP_SIZE × DP_SIZE` |
