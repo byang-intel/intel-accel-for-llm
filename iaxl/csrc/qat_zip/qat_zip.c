@@ -195,7 +195,7 @@ static int parse_selection(const char *env, int discovered, int *sel, int max_se
 static void instance_init(Instance *d, const RawInst *r) {
     CpaDcSessionSetupData sd = {0};
 
-    sd.compLevel = CPA_DC_L1;
+    sd.compLevel = (CpaDcCompLvl)(CPA_DC_L1 + envs.IAXL_ZIP_LEVEL - 1);
     sd.compType = CPA_DC_DEFLATE;
     sd.huffType = CPA_DC_HT_FULL_DYNAMIC;
     sd.sessDirection = CPA_DC_DIR_COMBINED;
