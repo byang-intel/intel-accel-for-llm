@@ -62,6 +62,7 @@ __attribute__((constructor(101))) void envs_init(void) {
                 envs.IAXL_ZIP_LEVEL);
         abort();
     }
+    envs.IAXL_ZIP_SEGMENT_SIZE_KB = env_nonnegative_int("IAXL_ZIP_SEGMENT_SIZE_KB", 0);
 
     envs.IAXL_QAT_ZIP_ENABLE = env_bool("IAXL_QAT_ZIP_ENABLE", 1);
     envs.IAXL_IAA_ZIP_ENABLE = env_bool("IAXL_IAA_ZIP_ENABLE", 0);

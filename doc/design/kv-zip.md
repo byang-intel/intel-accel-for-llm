@@ -74,7 +74,7 @@ QAT compresses without verification unless the QAT library is built in strict mo
 
 ## Segments
 
-Each tensor is split into 64 KiB segments, and every segment is a separate request. A tensor of `S` bytes has `max(1, S / 64 KiB)` segments; the last one also takes the remainder, so it is shorter than 128 KiB. Segments of one tensor run on any mix of backends at the same time, so a single large tensor keeps several requests in flight, and a tensor may be larger than `IAXL_ZIP_SRC_CAP` as long as every segment fits.
+`IAXL_ZIP_SEGMENT_SIZE_KB` sets the segment size in KiB. The default `0` keeps each tensor in one segment and one request, so the tensor must fit in `IAXL_ZIP_SRC_CAP` and, compressed, in `IAXL_ZIP_DST_CAP`. With `N` KiB, a tensor of `S` bytes has `max(1, S / (N × 1024))` segments (integer division); the last one also takes the remainder, so it is shorter than `2N` KiB. Every segment is a separate request. Segments of one tensor run on any mix of backends at the same time, so a single large tensor keeps several requests in flight, and a tensor may be larger than `IAXL_ZIP_SRC_CAP` as long as every segment fits. The first compression batch logs the sizes, e.g. `[kv_zip] block_size=262144 B segment_size=65536 B segments=4`.
 
 Each tensor still produces exactly one block:
 
@@ -91,7 +91,7 @@ A block is a `BlockHeader`, then one `SegmentEntry` per segment, then the payloa
 | `magic`, `version` | `"IAXZ"` and `1`. Blocks without them, such as caches persisted by older versions with the former 8-byte header, are rejected. |
 | `flags` | `kBlockShuffled`: each segment was BF16-shuffled on its own before compression |
 | `orig_size` | Tensor size in bytes |
-| `segment_size` | Bytes per segment (64 KiB); the last segment also takes the remainder |
+| `segment_size` | Bytes per segment, or `orig_size` when the tensor is one segment; the last segment also takes the remainder. Decompression reads it from the block, not from `IAXL_ZIP_SEGMENT_SIZE_KB` |
 | `segments` | Number of `SegmentEntry` records |
 
 | `SegmentEntry` field | Content |

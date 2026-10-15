@@ -54,7 +54,7 @@ out-of-tree 构建还需要 Boost/Boost Regex、SSL、udev 和 netlink 开发包
 | --- | --- |
 | `VLLM_CPU_KVCACHE_SPACE` | vLLM 运行时 KV cache 大小（GiB）。KVShrink 压缩缓存的大小由 `IAXL_DDR_POOL_SIZE_GB` 单独设置。 |
 | `MAX_MODEL_LEN` | `--max-model-len`（默认 `32765`）。CPU KV cache 放不下一个满长度请求时调小。 |
-| `BLOCK_SIZE` | `--block-size`（默认 `16`）。CPU 上每层一个 KV block 为 `2 × num_kv_heads × block_size × head_size × dtype_bytes` 字节，按 64 KiB 分段压缩（最后一段小于 128 KiB），因此只要 `IAXL_ZIP_SRC_CAP`、`IAXL_ZIP_DST_CAP` 不小于 128 KiB（默认都是 256 KiB），block 大小不受限制。 |
+| `BLOCK_SIZE` | `--block-size`（默认 `16`）。CPU 上每层一个 KV block 为 `2 × num_kv_heads × block_size × head_size × dtype_bytes` 字节，必须不超过 `IAXL_ZIP_SRC_CAP`，压缩后不超过 `IAXL_ZIP_DST_CAP`（`setvars.sh` 中都设为 4 MiB）。block 更大时，可以同时调大这两个值，或者设置 `IAXL_ZIP_SEGMENT_SIZE_KB`，按该大小（单位 KiB）分段压缩，这时只需每段（小于该大小的两倍）满足上述限制。 |
 | `IAXL_KV_DATA_SHUFFLE`、`IAXL_KV_LOSSY_TRUNC` | 两者都为 `0` 时，编解码直接从 vLLM 的 KV block 压缩、直接解压到 KV block，没有中转拷贝。`setvars.sh` 默认开启字节重排。任一开启都会改写编解码输入，block 需要先拷贝到 scratch buffer。字节重排能提升压缩率，代价是对每个 block 多做一遍处理。 |
 
 ## 5. 示例

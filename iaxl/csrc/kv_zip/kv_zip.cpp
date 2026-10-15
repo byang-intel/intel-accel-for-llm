@@ -7,8 +7,9 @@
 // request each. Up to IAXL_OMP_THREAD_NUM threads (see parallel.h) drive the workers, each polling
 // the slots of its workers without blocking, so a single thread can drive them all.
 //
-// An item is one 64 KB segment of a tensor, so a large tensor keeps several requests in flight.
-// Each tensor still becomes exactly one block: a header, a segment table and the segment payloads.
+// An item is one segment of a tensor: the whole tensor, or IAXL_ZIP_SEGMENT_SIZE_KB of it so that a
+// large tensor keeps several requests in flight. Each tensor still becomes exactly one block: a
+// header, a segment table and the segment payloads.
 //
 // QAT and CPU streams are mutually compatible, IAA streams are compatible with neither, so each
 // segment records whether IAA produced it and decompression only hands it to a backend that can
@@ -36,9 +37,6 @@
 #include "kv_zip.h"
 
 namespace kv_zip {
-
-// Tensors are split into segments of this size; the last segment also takes the remainder.
-static constexpr uint32_t kSegmentSize = 64 * 1024;
 
 // A block holds one tensor: a BlockHeader, `segments` SegmentEntry records, then the payloads.
 struct BlockHeader {
@@ -78,10 +76,19 @@ static uint32_t segment_count(uint32_t orig_size, uint32_t segment_size) {
     return std::max<uint32_t>(1, orig_size / segment_size);
 }
 
+// IAXL_ZIP_SEGMENT_SIZE_KB in bytes; 0, or a size not below the tensor's, keeps one segment.
+static uint32_t segment_size_for(uint32_t orig_size) {
+    const uint64_t size = uint64_t(envs.IAXL_ZIP_SEGMENT_SIZE_KB) * 1024;
+    if (size == 0 || size >= orig_size)
+        return std::max<uint32_t>(orig_size, 1);
+    return static_cast<uint32_t>(size);
+}
+
 static BlockHeader make_header(size_t orig_size, uint16_t flags) {
     const auto size = static_cast<uint32_t>(orig_size);
-    const uint32_t segments = segment_count(size, kSegmentSize);
-    return {kBlockMagic, kBlockVersion, flags, size, kSegmentSize, segments};
+    const uint32_t segment_size = segment_size_for(size);
+    const uint32_t segments = segment_count(size, segment_size);
+    return {kBlockMagic, kBlockVersion, flags, size, segment_size, segments};
 }
 
 // Tensor bytes of segment k, which starts at k * segment_size.
@@ -232,6 +239,15 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
         IAXL_CHECK(orig_sizes[i] <= static_cast<size_t>(INT_MAX),
                    "kv_zip: tensor byte size exceeds zip integer length range");
     }
+    if (n > 0) {
+        static std::once_flag logged;
+        std::call_once(logged, [&] {
+            const BlockHeader h = make_header(orig_sizes[0], 0);
+            printf("[kv_zip] block_size=%u B segment_size=%u B segments=%u\n", h.orig_size,
+                   h.segment_size, h.segments);
+            fflush(stdout);
+        });
+    }
 
     if (!compress || !envs.IAXL_KV_COMPRESSION) {
         parallel::parallel_for(n, [&](size_t i) {
@@ -320,7 +336,8 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
             char *src = b.data + size_t(r.index) * b.header.segment_size;
             const uint32_t len = segment_length(b.header, r.index);
             IAXL_CHECK(len <= static_cast<uint32_t>(ops(backend).src_cap()),
-                       "kv_zip: segment exceeds zip source capacity");
+                       "kv_zip: segment exceeds IAXL_ZIP_SRC_CAP; raise it or set "
+                       "IAXL_ZIP_SEGMENT_SIZE_KB");
             lossy_trunc(src, len, b.element_size);
             data_shuffle(src, len, true, (b.header.flags & kBlockShuffled) != 0);
             const int status = ops(backend).compress(slot, src, static_cast<int>(len));
