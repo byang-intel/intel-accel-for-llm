@@ -7,9 +7,12 @@
 // request each. Up to IAXL_OMP_THREAD_NUM threads (see parallel.h) drive the workers, each polling
 // the slots of its workers without blocking, so a single thread can drive them all.
 //
-// QAT and CPU streams are mutually compatible, IAA streams are compatible with neither, so a
-// compressed block records in its header whether IAA produced it and decompression only hands it
-// to a backend that can decode it.
+// An item is one 64 KB segment of a tensor, so a large tensor keeps several requests in flight.
+// Each tensor still becomes exactly one block: a header, a segment table and the segment payloads.
+//
+// QAT and CPU streams are mutually compatible, IAA streams are compatible with neither, so each
+// segment records whether IAA produced it and decompression only hands it to a backend that can
+// decode it.
 
 #include <torch/extension.h>
 
@@ -32,10 +35,73 @@
 #include "lossy.h"
 #include "kv_zip.h"
 
-// Top bit of the header's payload length field, set when IAA produced the stream.
-#define KV_ZIP_IAA_FLAG (1u << 31)
-
 namespace kv_zip {
+
+// Tensors are split into segments of this size; the last segment also takes the remainder.
+static constexpr uint32_t kSegmentSize = 64 * 1024;
+
+// A block holds one tensor: a BlockHeader, `segments` SegmentEntry records, then the payloads.
+struct BlockHeader {
+    uint32_t magic;        // kBlockMagic
+    uint16_t version;      // kBlockVersion
+    uint16_t flags;        // kBlockShuffled
+    uint32_t orig_size;    // tensor bytes
+    uint32_t segment_size; // tensor bytes per segment, the last one also takes the remainder
+    uint32_t segments;     // SegmentEntry records that follow
+};
+
+struct SegmentEntry {
+    uint32_t offset; // payload start, from the start of the block
+    uint32_t length; // payload bytes
+    uint32_t flags;  // kSegmentStored, kSegmentIaa
+};
+
+static_assert(sizeof(BlockHeader) == 20 && sizeof(SegmentEntry) == 12,
+              "the block layout is persisted and must not change");
+
+static constexpr uint32_t kBlockMagic = 0x5A584149; // "IAXZ" in memory
+static constexpr uint16_t kBlockVersion = 1;
+// Every segment was byte-shuffled on its own before compression.
+static constexpr uint16_t kBlockShuffled = 1u << 0;
+// The payload is the segment itself: compression was off or did not make it smaller.
+static constexpr uint32_t kSegmentStored = 1u << 0;
+// IAA produced the stream, so only IAA can decode it.
+static constexpr uint32_t kSegmentIaa = 1u << 1;
+
+// One segment of one block in a batch.
+struct SegmentRef {
+    uint32_t block;
+    uint32_t index;
+};
+
+static uint32_t segment_count(uint32_t orig_size, uint32_t segment_size) {
+    return std::max<uint32_t>(1, orig_size / segment_size);
+}
+
+static BlockHeader make_header(size_t orig_size, uint16_t flags) {
+    const auto size = static_cast<uint32_t>(orig_size);
+    const uint32_t segments = segment_count(size, kSegmentSize);
+    return {kBlockMagic, kBlockVersion, flags, size, kSegmentSize, segments};
+}
+
+// Tensor bytes of segment k, which starts at k * segment_size.
+static uint32_t segment_length(const BlockHeader &h, uint32_t k) {
+    return k + 1 < h.segments ? h.segment_size : h.orig_size - k * h.segment_size;
+}
+
+static size_t payload_start(uint32_t segments) {
+    return sizeof(BlockHeader) + segments * sizeof(SegmentEntry);
+}
+
+static const BlockHeader &block_header(const char *block) {
+    return *reinterpret_cast<const BlockHeader *>(block);
+}
+
+static const SegmentEntry *segment_table(const char *block) {
+    return reinterpret_cast<const SegmentEntry *>(block + sizeof(BlockHeader));
+}
+
+static size_t tensor_bytes(const torch::Tensor &t) { return t.numel() * t.element_size(); }
 
 enum class ZipBackend { QAT, IAA, CPU };
 
@@ -143,73 +209,145 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
     parallel::run_threads(threads, drive);
 }
 
+// Compression state of one tensor. Segments finishing while others are still in flight park their
+// streams in `staging`, and the last one to finish assembles the block.
+struct ZipBlock {
+    char *data = nullptr; // tensor bytes, prepared in place one segment at a time
+    int element_size = 0;
+    BlockHeader header{};
+    uint32_t first = 0; // position of segment 0 in the batch's segment list
+    std::atomic<uint32_t> pending{0};
+    std::atomic<char *> staging{nullptr};
+};
+
 void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vector<char *> &out_bufs,
                            std::vector<size_t> &out_sizes, std::vector<size_t> &orig_sizes,
                            bool compress) {
     const size_t n = tensors.size();
+    for (size_t i = 0; i < n; i++) {
+        const auto &t = tensors[i];
+        IAXL_CHECK(t.is_contiguous() && t.device().type() == c10::DeviceType::CPU,
+                   "kv_zip: tensor must be a contiguous CPU tensor");
+        orig_sizes[i] = tensor_bytes(t);
+        IAXL_CHECK(orig_sizes[i] <= static_cast<size_t>(INT_MAX),
+                   "kv_zip: tensor byte size exceeds zip integer length range");
+    }
 
     if (!compress || !envs.IAXL_KV_COMPRESSION) {
         parallel::parallel_for(n, [&](size_t i) {
-            const auto &tensor = tensors[i];
-            IAXL_CHECK(tensor.is_contiguous() && tensor.device().type() == c10::DeviceType::CPU,
-                       "kv_zip: tensor must be a contiguous CPU tensor");
-            const size_t nbytes = tensor.numel() * tensor.element_size();
-            char *buffer = static_cast<char *>(malloc(sizeof(int) * 2 + nbytes));
-            IAXL_CHECK(buffer != nullptr, "kv_zip: raw cache buffer allocation failed");
-            reinterpret_cast<int *>(buffer)[0] = 0;
-            reinterpret_cast<int *>(buffer)[1] = 0;
-            memcpy(buffer + sizeof(int) * 2, tensor.data_ptr(), nbytes);
-            out_bufs[i] = buffer;
-            out_sizes[i] = sizeof(int) * 2 + nbytes;
-            orig_sizes[i] = nbytes;
+            const BlockHeader h = make_header(orig_sizes[i], 0);
+            const size_t start = payload_start(h.segments);
+            char *buf = static_cast<char *>(malloc(start + h.orig_size));
+            IAXL_CHECK(buf != nullptr, "kv_zip: raw cache buffer allocation failed");
+            memcpy(buf, &h, sizeof(h));
+            auto *table = reinterpret_cast<SegmentEntry *>(buf + sizeof(h));
+            for (uint32_t k = 0; k < h.segments; k++)
+                table[k] = {static_cast<uint32_t>(start + size_t(k) * h.segment_size),
+                            segment_length(h, k), kSegmentStored};
+            memcpy(buf + start, tensors[i].data_ptr(), h.orig_size);
+            out_bufs[i] = buf;
+            out_sizes[i] = start + h.orig_size;
         });
         return;
     }
 
-    auto prep = [&](size_t i, char **data, size_t *nbytes) {
+    std::vector<ZipBlock> blocks(n);
+    std::vector<SegmentRef> segs;
+    segs.reserve(n);
+    for (size_t i = 0; i < n; i++) {
         const auto &t = tensors[i];
-        IAXL_CHECK(t.is_contiguous() && t.device().type() == c10::DeviceType::CPU,
-                   "kv_zip: tensor must be a contiguous CPU tensor");
-        size_t nb = t.numel() * t.element_size();
-        char *p = static_cast<char *>(t.data_ptr());
-        lossy_trunc(p, nb, t.element_size());
-        data_shuffle(p, nb, t.dtype() == torch::kBFloat16, data_shuffle_enabled());
-        orig_sizes[i] = nb;
-        *data = p;
-        *nbytes = nb;
+        ZipBlock &b = blocks[i];
+        b.data = static_cast<char *>(t.data_ptr());
+        b.element_size = static_cast<int>(t.element_size());
+        const bool shuffle = data_shuffle_enabled() && t.dtype() == torch::kBFloat16;
+        b.header = make_header(orig_sizes[i], shuffle ? kBlockShuffled : 0);
+        b.first = static_cast<uint32_t>(segs.size());
+        b.pending.store(b.header.segments, std::memory_order_relaxed);
+        for (uint32_t k = 0; k < b.header.segments; k++)
+            segs.push_back({static_cast<uint32_t>(i), k});
+    }
+    std::vector<SegmentEntry> entries(segs.size());
+
+    auto staging_of = [](ZipBlock &b) {
+        char *buf = b.staging.load(std::memory_order_acquire);
+        if (buf)
+            return buf;
+        char *fresh = static_cast<char *>(malloc(b.header.orig_size));
+        IAXL_CHECK(fresh != nullptr, "kv_zip: staging buffer allocation failed");
+        if (b.staging.compare_exchange_strong(buf, fresh, std::memory_order_acq_rel))
+            return fresh;
+        free(fresh);
+        return buf;
     };
 
-    auto pack = [&](size_t i, ZipBackend backend, const void *payload, int payload_len) {
-        char *buf = static_cast<char *>(malloc(sizeof(int) * 2 + payload_len));
+    // `stream` is set when segment `last` skipped the staging buffer.
+    auto assemble = [&](uint32_t i, uint32_t last, const char *stream) {
+        ZipBlock &b = blocks[i];
+        const BlockHeader &h = b.header;
+        SegmentEntry *table = &entries[b.first];
+        char *parked = b.staging.load(std::memory_order_acquire);
+        size_t size = payload_start(h.segments);
+        for (uint32_t k = 0; k < h.segments; k++)
+            size += table[k].length;
+        char *buf = static_cast<char *>(malloc(size));
         IAXL_CHECK(buf != nullptr, "kv_zip: cache buffer allocation failed");
-        reinterpret_cast<uint32_t *>(buf)[0] =
-            static_cast<uint32_t>(payload_len) |
-            (backend == ZipBackend::IAA ? KV_ZIP_IAA_FLAG : 0u);
-        reinterpret_cast<int *>(buf)[1] = static_cast<int>(orig_sizes[i]);
-        memcpy(buf + sizeof(int) * 2, payload, payload_len);
+        size_t offset = payload_start(h.segments);
+        for (uint32_t k = 0; k < h.segments; k++) {
+            const size_t at = size_t(k) * h.segment_size;
+            const char *src = (table[k].flags & kSegmentStored) ? b.data + at
+                              : (k == last && stream)            ? stream
+                                                                 : parked + at;
+            memcpy(buf + offset, src, table[k].length);
+            table[k].offset = static_cast<uint32_t>(offset);
+            offset += table[k].length;
+        }
+        memcpy(buf, &h, sizeof(h));
+        memcpy(buf + sizeof(h), table, h.segments * sizeof(SegmentEntry));
+        free(parked);
         out_bufs[i] = buf;
-        out_sizes[i] = sizeof(int) * 2 + payload_len;
+        out_sizes[i] = size;
     };
 
     std::atomic<size_t> next{0};
     zip_pipeline(
         [&](ZipBackend) {
-            const size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            return i < n ? i : kNoTask;
+            const size_t s = next.fetch_add(1, std::memory_order_relaxed);
+            return s < segs.size() ? s : kNoTask;
         },
-        [&](ZipBackend backend, int slot, size_t i) {
-            char *data;
-            size_t nb;
-            prep(i, &data, &nb);
-            IAXL_CHECK(nb <= static_cast<size_t>(INT_MAX),
-                       "kv_zip: tensor byte size exceeds zip integer length range");
-            IAXL_CHECK(nb <= static_cast<size_t>(ops(backend).src_cap()),
-                       "kv_zip: tensor byte size exceeds zip source capacity");
-            const int status = ops(backend).compress(slot, data, static_cast<int>(nb));
+        [&](ZipBackend backend, int slot, size_t s) {
+            const SegmentRef r = segs[s];
+            ZipBlock &b = blocks[r.block];
+            char *src = b.data + size_t(r.index) * b.header.segment_size;
+            const uint32_t len = segment_length(b.header, r.index);
+            IAXL_CHECK(len <= static_cast<uint32_t>(ops(backend).src_cap()),
+                       "kv_zip: segment exceeds zip source capacity");
+            lossy_trunc(src, len, b.element_size);
+            data_shuffle(src, len, true, (b.header.flags & kBlockShuffled) != 0);
+            const int status = ops(backend).compress(slot, src, static_cast<int>(len));
             IAXL_CHECK(status == 0, "kv_zip: zip compress failed");
         },
-        [&](ZipBackend backend, size_t i, void *out, int out_len) {
-            pack(i, backend, out, out_len);
+        [&](ZipBackend backend, size_t s, void *out, int out_len) {
+            const SegmentRef r = segs[s];
+            ZipBlock &b = blocks[r.block];
+            const uint32_t len = segment_length(b.header, r.index);
+            const char *stream = static_cast<const char *>(out);
+            if (static_cast<uint32_t>(out_len) < len) {
+                entries[s] = {0, static_cast<uint32_t>(out_len),
+                              backend == ZipBackend::IAA ? kSegmentIaa : 0u};
+            } else {
+                // Not compressible: keep the prepared bytes, which are still in the tensor.
+                entries[s] = {0, len, kSegmentStored};
+                stream = nullptr;
+            }
+            if (b.pending.load(std::memory_order_acquire) > 1) {
+                if (stream)
+                    memcpy(staging_of(b) + size_t(r.index) * b.header.segment_size, stream,
+                           out_len);
+                if (b.pending.fetch_sub(1, std::memory_order_acq_rel) > 1)
+                    return;
+                stream = nullptr;
+            }
+            assemble(r.block, r.index, stream);
         });
 }
 
@@ -218,63 +356,75 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
     const size_t n = tensors.size();
     IAXL_CHECK(data_ptrs.size() == n, "kv_zip: decompression inputs must have matching lengths");
 
-    auto copy_raw = [&](size_t i) {
-        const auto &t = tensors[i];
-        const size_t nb = t.numel() * t.element_size();
-        memcpy(t.data_ptr(), data_ptrs[i] + sizeof(int) * 2, nb);
-    };
-
-    // IAA-produced blocks must go back to IAA, everything else to QAT/CPU.
-    std::vector<size_t> raw_items, iaa_items, other_items;
+    // IAA-produced segments must go back to IAA, the other compressed ones to QAT/CPU.
+    std::vector<SegmentRef> stored, iaa, others;
     for (size_t i = 0; i < n; i++) {
-        const int *header = reinterpret_cast<const int *>(data_ptrs[i]);
-        if (header[1] == 0) {
-            raw_items.push_back(i);
-            continue;
+        const BlockHeader &h = block_header(data_ptrs[i]);
+        IAXL_CHECK(h.magic == kBlockMagic && h.version == kBlockVersion,
+                   "kv_zip: unknown block format, e.g. a KV cache persisted by an older iaxl");
+        IAXL_CHECK(h.orig_size == tensor_bytes(tensors[i]),
+                   "kv_zip: block size does not match tensor byte size");
+        IAXL_CHECK(h.segment_size > 0 && h.segments == segment_count(h.orig_size, h.segment_size),
+                   "kv_zip: invalid segment table");
+        const SegmentEntry *table = segment_table(data_ptrs[i]);
+        for (uint32_t k = 0; k < h.segments; k++) {
+            const SegmentRef r{static_cast<uint32_t>(i), k};
+            if (table[k].flags & kSegmentStored)
+                stored.push_back(r);
+            else if (table[k].flags & kSegmentIaa)
+                iaa.push_back(r);
+            else
+                others.push_back(r);
         }
-        const uint32_t encoded = static_cast<uint32_t>(header[0]);
-        IAXL_CHECK((encoded & ~KV_ZIP_IAA_FLAG) != 0,
-                   "kv_zip: invalid compressed payload length");
-        ((encoded & KV_ZIP_IAA_FLAG) ? iaa_items : other_items).push_back(i);
     }
 
-    parallel::parallel_for(raw_items.size(), [&](size_t k) { copy_raw(raw_items[k]); });
-
-    if (iaa_items.empty() && other_items.empty())
-        return;
-    IAXL_CHECK(iaa_items.empty() || envs.IAXL_IAA_ZIP_ENABLE,
-               "kv_zip: batch holds IAA-compressed blocks but the IAA backend is disabled");
-    IAXL_CHECK(other_items.empty() || envs.IAXL_QAT_ZIP_ENABLE || envs.IAXL_CPU_ZIP_ENABLE,
-               "kv_zip: batch holds QAT/CPU-compressed blocks but both backends are disabled");
-
-    auto finish = [&](size_t i, const void *out, int out_len) {
-        const auto &t = tensors[i];
-        const size_t nb = t.numel() * t.element_size();
-        IAXL_CHECK(out_len >= 0 && static_cast<size_t>(out_len) == nb,
-                   "kv_zip: decompressed size does not match tensor byte size");
-        char *dst = static_cast<char *>(t.data_ptr());
-        memcpy(dst, out, nb);
-        data_shuffle(dst, nb, t.dtype() == torch::kBFloat16, data_shuffle_enabled());
+    auto place = [&](SegmentRef r, const void *src, size_t len) {
+        const BlockHeader &h = block_header(data_ptrs[r.block]);
+        IAXL_CHECK(len == segment_length(h, r.index),
+                   "kv_zip: decompressed size does not match segment size");
+        char *dst = static_cast<char *>(tensors[r.block].data_ptr()) +
+                    size_t(r.index) * h.segment_size;
+        memcpy(dst, src, len);
+        data_shuffle(dst, len, true, (h.flags & kBlockShuffled) != 0);
     };
 
-    std::atomic<size_t> iaa_next{0}, other_next{0};
+    parallel::parallel_for(stored.size(), [&](size_t j) {
+        const SegmentRef r = stored[j];
+        const SegmentEntry &e = segment_table(data_ptrs[r.block])[r.index];
+        place(r, data_ptrs[r.block] + e.offset, e.length);
+    });
+
+    if (iaa.empty() && others.empty())
+        return;
+    IAXL_CHECK(iaa.empty() || envs.IAXL_IAA_ZIP_ENABLE,
+               "kv_zip: batch holds IAA-compressed segments but the IAA backend is disabled");
+    IAXL_CHECK(others.empty() || envs.IAXL_QAT_ZIP_ENABLE || envs.IAXL_CPU_ZIP_ENABLE,
+               "kv_zip: batch holds QAT/CPU-compressed segments but both backends are disabled");
+
+    // IAA segments first, then the others, each range with its own cursor.
+    const size_t iaa_end = iaa.size();
+    std::vector<SegmentRef> segs = std::move(iaa);
+    segs.insert(segs.end(), others.begin(), others.end());
+    std::atomic<size_t> iaa_next{0}, other_next{iaa_end};
     zip_pipeline(
         [&](ZipBackend backend) {
-            const bool iaa = backend == ZipBackend::IAA;
-            const std::vector<size_t> &items = iaa ? iaa_items : other_items;
-            std::atomic<size_t> &cursor = iaa ? iaa_next : other_next;
-            const size_t k = cursor.fetch_add(1, std::memory_order_relaxed);
-            return k < items.size() ? items[k] : kNoTask;
+            if (backend == ZipBackend::IAA) {
+                const size_t s = iaa_next.fetch_add(1, std::memory_order_relaxed);
+                return s < iaa_end ? s : kNoTask;
+            }
+            const size_t s = other_next.fetch_add(1, std::memory_order_relaxed);
+            return s < segs.size() ? s : kNoTask;
         },
-        [&](ZipBackend backend, int slot, size_t i) {
-            const uint32_t encoded = reinterpret_cast<const uint32_t *>(data_ptrs[i])[0];
-            const char *payload = data_ptrs[i] + sizeof(int) * 2;
-            const int payload_len = static_cast<int>(encoded & ~KV_ZIP_IAA_FLAG);
-            const int status =
-                ops(backend).decompress(slot, const_cast<char *>(payload), payload_len);
+        [&](ZipBackend backend, int slot, size_t s) {
+            const SegmentRef r = segs[s];
+            const SegmentEntry &e = segment_table(data_ptrs[r.block])[r.index];
+            char *payload = const_cast<char *>(data_ptrs[r.block] + e.offset);
+            const int status = ops(backend).decompress(slot, payload, static_cast<int>(e.length));
             IAXL_CHECK(status == 0, "kv_zip: zip decompress failed");
         },
-        [&](ZipBackend, size_t i, void *out, int out_len) { finish(i, out, out_len); });
+        [&](ZipBackend, size_t s, void *out, int out_len) {
+            place(segs[s], out, static_cast<size_t>(out_len));
+        });
 }
 
 } // namespace kv_zip

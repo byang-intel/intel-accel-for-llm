@@ -54,7 +54,7 @@ When choosing CPUs:
 | --- | --- |
 | `VLLM_CPU_KVCACHE_SPACE` | Live vLLM KV cache size in GiB. `IAXL_DDR_POOL_SIZE_GB` sizes the compressed KVShrink cache independently. |
 | `MAX_MODEL_LEN` | `--max-model-len` (default `32765`). Lower it when the CPU KV cache cannot hold one full-length request. |
-| `BLOCK_SIZE` | `--block-size` (default `16`). A CPU KV block holds `2 × num_kv_heads × block_size × head_size × dtype_bytes` bytes per layer and must fit in `IAXL_ZIP_SRC_CAP` and, compressed, in `IAXL_ZIP_DST_CAP` (both 256 KiB by default). |
+| `BLOCK_SIZE` | `--block-size` (default `16`). A CPU KV block holds `2 × num_kv_heads × block_size × head_size × dtype_bytes` bytes per layer. It is compressed in 64 KiB segments (the last one under 128 KiB), so any block size works while `IAXL_ZIP_SRC_CAP` and `IAXL_ZIP_DST_CAP` stay at 128 KiB or more (both 256 KiB by default). |
 | `IAXL_KV_DATA_SHUFFLE`, `IAXL_KV_LOSSY_TRUNC` | With both set to `0`, the codec compresses straight from the vLLM KV blocks and decompresses straight into them, with no staging copies. `setvars.sh` enables shuffle by default. Either one rewrites the codec input, so blocks are staged in scratch buffers. Shuffle improves the compression ratio at the cost of one extra pass over every block. |
 
 ## 5. Example

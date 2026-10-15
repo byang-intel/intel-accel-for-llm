@@ -46,9 +46,9 @@ flowchart LR
 
 Every thread runs the same loop over its slots:
 
-1. **Fill:** claim items from the shared cursor and submit one item per slot. Before submitting, compression applies optional lossy truncation and a BF16 byte shuffle to the data in place.
+1. **Fill:** claim items from the shared cursor and submit one item per slot. An item is one segment of a tensor (see [Segments](#segments)). Before submitting, compression applies optional lossy truncation and a BF16 byte shuffle to the segment in place.
 2. **Poll:** go round the in-flight slots calling the backend's `wait(..., non_block=1)`. A result of `IAXL_ZIP_PENDING` moves on to the next slot.
-3. **Refill:** when a request completes, finish its item. For compression this means writing the block header; for decompression it means copying the data out and undoing the shuffle. Then claim the next item and resubmit it into the same slot. A slot is retired once the cursor is empty.
+3. **Refill:** when a request completes, finish its item. For compression this means keeping the stream until the tensor's last segment finishes and assembles the block; for decompression it means copying the segment into its tensor and undoing the shuffle. Then claim the next item and resubmit it into the same slot. A slot is retired once the cursor is empty.
 
 Items are claimed as requests complete instead of being split up front, so faster backends automatically take a larger share of the batch. Polling never blocks, which allows `T` to range from 1 up to the worker count. At `T = 1` the caller drives every worker alone.
 
@@ -72,22 +72,40 @@ QAT compresses without verification unless the QAT library is built in strict mo
 | `oot` (default) | QAT20 package built with `--disable-dc-strict-mode` | Off |
 | `intree` | System qatlib, always strict | On; each compression is also decompressed and checked by the device |
 
+## Segments
+
+Each tensor is split into 64 KiB segments, and every segment is a separate request. A tensor of `S` bytes has `max(1, S / 64 KiB)` segments; the last one also takes the remainder, so it is shorter than 128 KiB. Segments of one tensor run on any mix of backends at the same time, so a single large tensor keeps several requests in flight, and a tensor may be larger than `IAXL_ZIP_SRC_CAP` as long as every segment fits.
+
+Each tensor still produces exactly one block:
+
+- A segment that finishes while others of its tensor are still in flight copies its stream into a staging buffer of that tensor.
+- The last segment to finish allocates the block at its exact size and copies in the header, the segment table, the staged streams and its own stream.
+- A segment whose stream is not smaller than the segment itself is stored as is, so a block never grows beyond the tensor size plus the header.
+
 ## Block Format and Routing
 
-Every stored block starts with an 8-byte header in front of its payload.
+A block is a `BlockHeader`, then one `SegmentEntry` per segment, then the payloads in segment order. All fields are little-endian `uint32_t`, except `version` and `flags` in `BlockHeader`, which are `uint16_t`.
 
-| Word | Content |
+| `BlockHeader` field | Content |
 | --- | --- |
-| 0 | Payload length; bit 31 is set when IAA produced the stream |
-| 1 | Original byte size; `0` marks a raw (uncompressed) block |
+| `magic`, `version` | `"IAXZ"` and `1`. Blocks without them, such as caches persisted by older versions with the former 8-byte header, are rejected. |
+| `flags` | `kBlockShuffled`: each segment was BF16-shuffled on its own before compression |
+| `orig_size` | Tensor size in bytes |
+| `segment_size` | Bytes per segment (64 KiB); the last segment also takes the remainder |
+| `segments` | Number of `SegmentEntry` records |
 
-Decompression routes each block by its header:
+| `SegmentEntry` field | Content |
+| --- | --- |
+| `offset`, `length` | Payload position from the start of the block, and its length |
+| `flags` | `kSegmentStored`: the payload is the segment itself; `kSegmentIaa`: IAA produced the stream |
 
-- Raw blocks are copied with `parallel::parallel_for`.
-- IAA-produced blocks go only to IAA workers.
-- All other blocks go to QAT or CPU workers.
+Decompression routes each segment by its flags:
 
-IAA and QAT/CPU blocks are tracked with two separate cursors. Batches stored without compression (`IAXL_KV_COMPRESSION=0`, or leading layers that bypass compression) use the raw path in both directions.
+- Stored segments are copied with `parallel::parallel_for`.
+- IAA streams go only to IAA workers.
+- All other streams go to QAT or CPU workers.
+
+IAA and QAT/CPU segments are tracked with two separate cursors. Batches stored without compression (`IAXL_KV_COMPRESSION=0`, or leading layers that bypass compression) consist of stored segments only, so they use the copy path in both directions.
 
 ## Threading Runtime
 
