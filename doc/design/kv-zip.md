@@ -78,8 +78,8 @@ QAT compresses without verification unless the QAT library is built in strict mo
 
 Each tensor still produces exactly one block:
 
-- A segment that finishes while others of its tensor are still in flight copies its stream into a staging buffer of that tensor.
-- The last segment to finish allocates the block at its exact size and copies in the header, the segment table, the staged streams and its own stream.
+- A segment that finishes while others of its tensor are still in flight copies its stream over its own bytes in the tensor. Its input is already in the backend's buffer and the stream is shorter, so no other segment is touched.
+- The last segment to finish allocates the block at its exact size and copies in the header, the segment table, the parked streams and its own stream.
 - A segment whose stream is not smaller than the segment itself is stored as is, so a block never grows beyond the tensor size plus the header.
 
 ## Block Format and Routing

@@ -217,14 +217,13 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
 }
 
 // Compression state of one tensor. Segments finishing while others are still in flight park their
-// streams in `staging`, and the last one to finish assembles the block.
+// streams over their own bytes in the tensor, and the last one to finish assembles the block.
 struct ZipBlock {
     char *data = nullptr; // tensor bytes, prepared in place one segment at a time
     int element_size = 0;
     BlockHeader header{};
     uint32_t first = 0; // position of segment 0 in the batch's segment list
     std::atomic<uint32_t> pending{0};
-    std::atomic<char *> staging{nullptr};
 };
 
 void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vector<char *> &out_bufs,
@@ -284,24 +283,11 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
     }
     std::vector<SegmentEntry> entries(segs.size());
 
-    auto staging_of = [](ZipBlock &b) {
-        char *buf = b.staging.load(std::memory_order_acquire);
-        if (buf)
-            return buf;
-        char *fresh = static_cast<char *>(malloc(b.header.orig_size));
-        IAXL_CHECK(fresh != nullptr, "kv_zip: staging buffer allocation failed");
-        if (b.staging.compare_exchange_strong(buf, fresh, std::memory_order_acq_rel))
-            return fresh;
-        free(fresh);
-        return buf;
-    };
-
-    // `stream` is set when segment `last` skipped the staging buffer.
+    // `stream` is set when segment `last` was not parked in the tensor.
     auto assemble = [&](uint32_t i, uint32_t last, const char *stream) {
         ZipBlock &b = blocks[i];
         const BlockHeader &h = b.header;
         SegmentEntry *table = &entries[b.first];
-        char *parked = b.staging.load(std::memory_order_acquire);
         size_t size = payload_start(h.segments);
         for (uint32_t k = 0; k < h.segments; k++)
             size += table[k].length;
@@ -309,17 +295,13 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
         IAXL_CHECK(buf != nullptr, "kv_zip: cache buffer allocation failed");
         size_t offset = payload_start(h.segments);
         for (uint32_t k = 0; k < h.segments; k++) {
-            const size_t at = size_t(k) * h.segment_size;
-            const char *src = (table[k].flags & kSegmentStored) ? b.data + at
-                              : (k == last && stream)            ? stream
-                                                                 : parked + at;
+            const char *src = (k == last && stream) ? stream : b.data + size_t(k) * h.segment_size;
             memcpy(buf + offset, src, table[k].length);
             table[k].offset = static_cast<uint32_t>(offset);
             offset += table[k].length;
         }
         memcpy(buf, &h, sizeof(h));
         memcpy(buf + sizeof(h), table, h.segments * sizeof(SegmentEntry));
-        free(parked);
         out_bufs[i] = buf;
         out_sizes[i] = size;
     };
@@ -357,9 +339,9 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
                 stream = nullptr;
             }
             if (b.pending.load(std::memory_order_acquire) > 1) {
+                // The segment's input is already consumed and the stream is shorter than it.
                 if (stream)
-                    memcpy(staging_of(b) + size_t(r.index) * b.header.segment_size, stream,
-                           out_len);
+                    memcpy(b.data + size_t(r.index) * b.header.segment_size, stream, out_len);
                 if (b.pending.fetch_sub(1, std::memory_order_acq_rel) > 1)
                     return;
                 stream = nullptr;
