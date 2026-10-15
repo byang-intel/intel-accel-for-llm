@@ -5,7 +5,8 @@
 // completes, so the faster backend naturally processes more of the batch. QAT and IAA workers keep
 // multiple asynchronous requests in flight, while CPU workers run one synchronous raw-DEFLATE
 // request each. Up to IAXL_OMP_THREAD_NUM threads (see parallel.h) drive the workers, each polling
-// the slots of its workers without blocking, so a single thread can drive them all.
+// its slots without blocking, so a single thread can drive them all. With more threads than
+// workers, the slots of one worker are split between threads.
 //
 // An item is one segment of a tensor: the whole tensor, or IAXL_ZIP_SEGMENT_SIZE_KB of it so that a
 // large tensor keeps several requests in flight. Each tensor still becomes exactly one block: a
@@ -155,18 +156,18 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
                "kv_zip: IAXL_QAT_INSTANCE_NUM exceeds available QAT instances");
     IAXL_CHECK(iaa_workers == 0 || iaa_workers <= iaa_zip_num_slots() / iaa_zip_queue_depth(),
                "kv_zip: IAXL_IAA_INSTANCE_NUM exceeds available IAA instances");
-    const int threads = std::min(envs.IAXL_OMP_THREAD_NUM, worker_count);
-
-    // Thread `tid` owns workers tid, tid + threads, ..., so each backend instance stays on one
-    // thread while the backends are spread across all of them.
-    auto drive = [&](int tid) {
-        struct Lane {
-            ZipBackend backend;
-            int slot;
-            size_t item;
-        };
-        std::vector<Lane> lanes;
-        for (int w = tid; w < worker_count; w += threads) {
+    struct Lane {
+        ZipBackend backend;
+        int slot;
+        size_t item;
+        int owner; // driving thread
+    };
+    // Slot k of every worker comes before slot k + 1 of any, so that threads beyond the worker
+    // count split the slots of one worker. The backends keep all request state per slot.
+    std::vector<Lane> all;
+    for (int k = 0;; k++) {
+        const size_t before = all.size();
+        for (int w = 0; w < worker_count; w++) {
             ZipBackend backend = ZipBackend::CPU;
             int first = qat_workers + iaa_workers;
             if (w < qat_workers) {
@@ -177,14 +178,28 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
                 first = qat_workers;
             }
             const int depth = ops(backend).queue_depth();
-            for (int k = 0; k < depth; k++) {
-                const size_t i = get_next(backend);
-                if (i == kNoTask)
-                    break;
-                const int slot = (w - first) * depth + k;
-                submit(backend, slot, i);
-                lanes.push_back({backend, slot, i});
-            }
+            if (k < depth)
+                all.push_back({backend, (w - first) * depth + k, kNoTask, w});
+        }
+        if (all.size() == before)
+            break;
+    }
+    const int threads = static_cast<int>(std::min<size_t>(envs.IAXL_OMP_THREAD_NUM, all.size()));
+    // Up to one thread per worker, each worker stays on one thread so no instance is polled from
+    // two; extra threads take the slots round-robin.
+    for (size_t j = 0; j < all.size(); j++)
+        all[j].owner = threads <= worker_count ? all[j].owner % threads : int(j % threads);
+
+    auto drive = [&](int tid) {
+        std::vector<Lane> lanes;
+        for (const Lane &l : all) {
+            if (l.owner != tid)
+                continue;
+            const size_t i = get_next(l.backend);
+            if (i == kNoTask)
+                continue;
+            submit(l.backend, l.slot, i);
+            lanes.push_back({l.backend, l.slot, i, tid});
         }
 
         while (!lanes.empty()) {

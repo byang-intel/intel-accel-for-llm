@@ -127,7 +127,8 @@ case "${IAXL_CPU_ZIP_ENABLE,,}" in
     *) export IAXL_CPU_ZIP_THREADS=0 ;;
 esac
 if env_truthy "$IAXL_QAT_ZIP_ENABLE" "$IAXL_IAA_ZIP_ENABLE" "$IAXL_CPU_ZIP_ENABLE"; then
-    # Defaults to one thread per zip worker; fewer threads each poll several workers (1 = caller only).
+    # Defaults to one thread per zip worker; fewer threads each poll several workers (1 = caller only),
+    # more threads split a worker's in-flight requests (up to one thread per request).
     export IAXL_OMP_THREAD_NUM=${IAXL_OMP_THREAD_NUM:-$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM")} || return 1 2>/dev/null || exit 1
 else
     # No zip worker: OpenMP threads only copy raw KV blocks on the host; cap at 4.

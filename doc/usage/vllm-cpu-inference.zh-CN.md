@@ -42,7 +42,7 @@ out-of-tree 构建还需要 Boost/Boost Regex、SSL、udev 和 netlink 开发包
 | 变量 | 推荐值 | 作用 |
 | --- | --- | --- |
 | `IAXL_USE_OMP` | `0`（`DEVICE=cpu` 时的默认值） | IAXL 不用 OpenMP，改用自己的线程池，OpenMP 留给 vLLM。此时 `setvars.sh` 会 unset `OMP_NUM_THREADS` 和 `OMP_THREAD_LIMIT`。 |
-| `IAXL_OMP_THREAD_NUM` | `1` 或 `2` | 驱动压缩 worker 的线程数。一个线程就能让多个 QAT/IAA 实例保持忙碌。取值范围是 1 到 worker 数。 |
+| `IAXL_OMP_THREAD_NUM` | `1` 或 `2` | 驱动压缩 worker 的线程数。一个线程就能让多个 QAT/IAA 实例保持忙碌；线程数超过 worker 数时，各 worker 的在途请求分给多个线程。 |
 | `IAXL_CPU_ZIP_ENABLE` | `0` | 不占用 CPU 核跑 zlib，由 QAT 和 IAA 压缩。 |
 | `IAXL_QAT_ZIP_ENABLE`、`IAXL_IAA_ZIP_ENABLE` | 有哪种加速器就设为 `1` | worker 数为 `IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM`，`setvars.sh` 会打印这两个值。 |
 
@@ -100,7 +100,7 @@ export IAXL_OMP_THREAD_NUM=2
 | `KVSHRINK_CPU_OMP_THREADS_BIND has N entries, but rank is R` | 每个 rank 提供一项，共 `TP_SIZE × DP_SIZE` 项。 |
 | `invalid IAXL_CPU_OMP_THREADS_BIND` | 某一项不是合法的 CPU 列表。 |
 | `cannot bind to IAXL_CPU_OMP_THREADS_BIND` | 列出的 CPU 进程都用不了，例如不在容器的 cpuset 内。 |
-| `IAXL_OMP_THREAD_NUM must be between 1 and ...` | 调小 `IAXL_OMP_THREAD_NUM`，或启用更多 QAT/IAA 实例。 |
+| `IAXL_OMP_THREAD_NUM must be a positive integer` | 把 `IAXL_OMP_THREAD_NUM` 设为 1 或更大。 |
 | `IAXL_OMP_THREAD_NUM (...) + reserved (...) exceeds the smallest rank CPU allocation` | `VLLM_CPU_OMP_THREADS_BIND` 中最小的一项 CPU 太少。调小 `IAXL_RESERVED_CPU_NUM` 或 `IAXL_OMP_THREAD_NUM`。 |
 | vLLM 警告 `LD_PRELOAD` 中没有 libiomp 或 libtcmalloc | 用 `examples/kvshrink-vllm-serve.sh` 启动 vLLM。 |
 | `RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link` | 跨节点 KV cache 复用需要 CUDA 或 XPU 构建。 |

@@ -73,9 +73,10 @@ static int g_dev_node[MAX_DEVICES];
 static int g_dev_accel[MAX_DEVICES];
 static int g_dev_count = 0;
 
+// Runs in whichever thread polls the instance, which may not own the slot.
 static void dc_callback(void *cb_param, CpaStatus status) {
     (void)status;
-    *(int *)cb_param = 1;
+    __atomic_store_n((int *)cb_param, 1, __ATOMIC_RELEASE);
 }
 
 static int submit_op(Instance *d, int si, int compress, void *src, uint32_t src_len, void *dst,
@@ -108,9 +109,9 @@ static int submit_op(Instance *d, int si, int compress, void *src, uint32_t src_
 
 static int wait_op(Instance *d, int si, int non_block, uint32_t *produced) {
     Slot *sl = &d->slot[si];
-    while (!sl->done) {
+    while (!__atomic_load_n(&sl->done, __ATOMIC_ACQUIRE)) {
         icp_sal_DcPollInstance(d->inst, 0);
-        if (non_block && !sl->done)
+        if (non_block && !__atomic_load_n(&sl->done, __ATOMIC_ACQUIRE))
             return IAXL_ZIP_PENDING;
     }
     if (sl->res.status != CPA_DC_OK)

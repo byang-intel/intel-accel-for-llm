@@ -17,7 +17,7 @@ flowchart TD
     Ctx["Context: zip_to_mem / unzip_from_mem"] --> Queue["OMP-Main TaskQueue<br/>one batch at a time"]
     Queue --> Batch["kv_zip_compress_batch / kv_zip_decompress_batch"]
     Batch --> Cursor["Shared item cursor"]
-    Batch --> Run["parallel::run_threads<br/>T = min(IAXL_OMP_THREAD_NUM, workers)"]
+    Batch --> Run["parallel::run_threads<br/>T = min(IAXL_OMP_THREAD_NUM, slots)"]
     Run --> OMP["OpenMP team<br/>IAXL_USE_OMP=1"]
     Run --> TP["parallel::ThreadPool<br/>IAXL_USE_OMP=0"]
     OMP & TP --> Threads["Threads 0..T-1<br/>thread 0 is the caller"]
@@ -36,7 +36,7 @@ A **worker** is one backend instance together with its slots:
 - Each QAT or IAA instance keeps `queue_depth` asynchronous requests in flight.
 - A CPU worker has a single slot and finishes its zlib request inside the submit call.
 
-Workers are numbered QAT first, then IAA, then CPU. Thread `t` owns workers `t, t+T, t+2T, …`. Each instance is therefore polled by exactly one thread, so instances need no locking. The example below uses 2 QAT, 2 IAA and 1 CPU worker with `T = 2`.
+Workers are numbered QAT first, then IAA, then CPU. When `T` is at most the worker count, thread `t` owns workers `t, t+T, t+2T, …`, so each instance is polled by exactly one thread. When `T` is larger, the slots are dealt round-robin (slot 0 of every worker, then slot 1, …), so the slots of one worker are split between threads, up to one thread per slot. The backends keep all request state per slot, and QAT submit and poll are thread-safe on a shared instance, so this needs no locking either. The example below uses 2 QAT, 2 IAA and 1 CPU worker with `T = 2`.
 
 ```mermaid
 flowchart LR
@@ -50,7 +50,7 @@ Every thread runs the same loop over its slots:
 2. **Poll:** go round the in-flight slots calling the backend's `wait(..., non_block=1)`. A result of `IAXL_ZIP_PENDING` moves on to the next slot.
 3. **Refill:** when a request completes, finish its item. For compression this means keeping the stream until the tensor's last segment finishes and assembles the block; for decompression it means copying the segment into its tensor and undoing the shuffle. Then claim the next item and resubmit it into the same slot. A slot is retired once the cursor is empty.
 
-Items are claimed as requests complete instead of being split up front, so faster backends automatically take a larger share of the batch. Polling never blocks, which allows `T` to range from 1 up to the worker count. At `T = 1` the caller drives every worker alone.
+Items are claimed as requests complete instead of being split up front, so faster backends automatically take a larger share of the batch. Polling never blocks, which allows `T` to range from 1 up to the slot count. At `T = 1` the caller drives every worker alone. More threads than workers help when the per-request host work (shuffle, copy into the DMA buffer, block assembly) limits throughput, e.g. with small segments.
 
 ### Fewer Threads Than Workers
 
@@ -174,7 +174,7 @@ vLLM's CPU backend also recommends preloading libiomp5 and libtcmalloc through `
 | `IAXL_QAT_ZIP_ENABLE`, `IAXL_IAA_ZIP_ENABLE`, `IAXL_CPU_ZIP_ENABLE` | Enable each backend |
 | `IAXL_QAT_INSTANCE_NUM`, `IAXL_IAA_INSTANCE_NUM`, `IAXL_CPU_ZIP_THREADS` | Number of workers per backend |
 | `IAXL_QAT_ZIP_QUEUE_DEPTH`, `IAXL_IAA_ZIP_QUEUE_DEPTH` | In-flight requests per QAT / IAA worker (≤ 4) |
-| `IAXL_OMP_THREAD_NUM` | Thread count `T`. Defaults to the worker count and must be between 1 and the worker count. With `IAXL_USE_OMP=1`, it is also exported as `OMP_NUM_THREADS` and `OMP_THREAD_LIMIT`. |
+| `IAXL_OMP_THREAD_NUM` | Thread count `T`. Defaults to the worker count; any positive value is accepted, and threads beyond the total slot count stay idle. With `IAXL_USE_OMP=1`, it is also exported as `OMP_NUM_THREADS` and `OMP_THREAD_LIMIT`. |
 | `IAXL_USE_OMP` | `1` for OpenMP, `0` for `ThreadPool`; `setvars.sh` defaults to `0` with `DEVICE=cpu` |
 | `IAXL_CPU_OMP_THREADS_BIND` | CPUs for iaxl's threads in this process |
 | `KVSHRINK_CPU_OMP_THREADS_BIND` | CPUs for iaxl's threads for each rank, separated by `\|`. Defaults to `VLLM_CPU_OMP_THREADS_BIND`. |
