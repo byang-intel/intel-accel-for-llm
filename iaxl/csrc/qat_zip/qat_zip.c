@@ -320,6 +320,12 @@ int qat_zip_num_slots(void) { return g_inst_count * g_queue_depth; }
 int qat_zip_queue_depth(void) { return g_queue_depth; }
 int qat_zip_src_cap(void) { return (int)g_src_cap; }
 
+void *qat_zip_src_buf(int slot) {
+    if (slot < 0 || slot >= g_inst_count * g_queue_depth)
+        return NULL;
+    return g_inst[slot / g_queue_depth].slot[slot % g_queue_depth].in;
+}
+
 static int submit_slot(int slot, int compress, void *src, int len) {
     if (slot < 0 || slot >= g_inst_count * g_queue_depth)
         return -1;
@@ -333,7 +339,8 @@ static int submit_slot(int slot, int compress, void *src, int len) {
     int si = slot % g_queue_depth;
     Slot *sl = &in->slot[si];
 
-    memcpy(sl->in, src, (size_t)len);
+    if (src != sl->in)
+        memcpy(sl->in, src, (size_t)len);
     return submit_op(in, si, compress, sl->in, (uint32_t)len, sl->out, output_cap);
 }
 

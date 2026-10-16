@@ -8,7 +8,7 @@
 | --- | --- |
 | `iaxl/csrc/kv_zip/kv_zip.cpp` | Batch pipeline and block format |
 | `iaxl/csrc/include/parallel.h`, `iaxl/csrc/common/parallel.cpp` | Generic `run_threads`, `parallel_for`, and `ThreadPool` |
-| `iaxl/csrc/{qat,iaa,cpu}_zip/` | Backends with slot-based `compress` / `decompress` / `wait` |
+| `iaxl/csrc/{qat,iaa,cpu}_zip/` | Backends with slot-based `compress` / `decompress` / `wait` and a per-slot input buffer (`src_buf`) |
 
 ## Architecture
 
@@ -46,11 +46,11 @@ flowchart LR
 
 Every thread runs the same loop over its slots:
 
-1. **Fill:** claim items from the shared cursor and submit one item per slot. An item is one segment of a tensor (see [Segments](#segments)). Before submitting, compression applies optional lossy truncation and a BF16 byte shuffle to the segment in place.
+1. **Fill:** claim items from the shared cursor and submit one item per slot. An item is one segment of a tensor (see [Segments](#segments)). Compression copies the segment into the slot's input buffer (`src_buf`), applying optional lossy truncation and the BF16 byte shuffle in the same pass, so the backend does not copy it again.
 2. **Poll:** go round the in-flight slots calling the backend's `wait(..., non_block=1)`. A result of `IAXL_ZIP_PENDING` moves on to the next slot.
-3. **Refill:** when a request completes, finish its item. For compression this means keeping the stream until the tensor's last segment finishes and assembles the block; for decompression it means copying the segment into its tensor and undoing the shuffle. Then claim the next item and resubmit it into the same slot. A slot is retired once the cursor is empty.
+3. **Refill:** when a request completes, finish its item. For compression this means keeping the payload until the tensor's last segment finishes and assembles the block; for decompression it means copying the segment into its tensor, undoing the shuffle in the same pass. Then claim the next item and resubmit it into the same slot. A slot is retired once the cursor is empty.
 
-Items are claimed as requests complete instead of being split up front, so faster backends automatically take a larger share of the batch. Polling never blocks, which allows `T` to range from 1 up to the slot count. At `T = 1` the caller drives every worker alone. More threads than workers help when the per-request host work (shuffle, copy into the DMA buffer, block assembly) limits throughput, e.g. with small segments.
+Items are claimed as requests complete instead of being split up front, so faster backends automatically take a larger share of the batch. Polling never blocks, which allows `T` to range from 1 up to the slot count. At `T = 1` the caller drives every worker alone. More threads than workers help when the per-request host work (preparing the segment in the DMA buffer, block assembly) limits throughput, e.g. with small segments.
 
 ### Fewer Threads Than Workers
 
@@ -78,9 +78,9 @@ QAT compresses without verification unless the QAT library is built in strict mo
 
 Each tensor still produces exactly one block:
 
-- A segment that finishes while others of its tensor are still in flight copies its stream over its own bytes in the tensor. Its input is already in the backend's buffer and the stream is shorter, so no other segment is touched.
-- The last segment to finish allocates the block at its exact size and copies in the header, the segment table, the parked streams and its own stream.
-- A segment whose stream is not smaller than the segment itself is stored as is, so a block never grows beyond the tensor size plus the header.
+- A segment that finishes while others of its tensor are still in flight copies its payload (the stream, or the prepared segment when stored) over its own bytes in the tensor. Those bytes were read at submit and the payload is not longer, so no other segment is touched.
+- The last segment to finish allocates the block at its exact size and copies in the header, the segment table, the parked payloads and its own payload.
+- A segment whose stream is not smaller than the segment itself is stored as prepared instead, so a block never grows beyond the tensor size plus the header.
 
 ## Block Format and Routing
 

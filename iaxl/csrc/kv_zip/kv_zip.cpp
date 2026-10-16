@@ -118,14 +118,14 @@ struct ZipOps {
     int (*compress)(int slot, void *src, int len);
     int (*decompress)(int slot, void *src, int len);
     int (*wait)(int slot, void **dest, int *len, int non_block);
-    int (*src_cap)(void);
+    void *(*src_buf)(int slot);
     int (*queue_depth)(void);
 };
 
 static const ZipOps kZipOps[] = {
-    {qat_zip_compress, qat_zip_decompress, qat_zip_wait, qat_zip_src_cap, qat_zip_queue_depth},
-    {iaa_zip_compress, iaa_zip_decompress, iaa_zip_wait, iaa_zip_src_cap, iaa_zip_queue_depth},
-    {cpu_zip_compress, cpu_zip_decompress, cpu_zip_wait, cpu_zip_src_cap, cpu_zip_queue_depth},
+    {qat_zip_compress, qat_zip_decompress, qat_zip_wait, qat_zip_src_buf, qat_zip_queue_depth},
+    {iaa_zip_compress, iaa_zip_decompress, iaa_zip_wait, iaa_zip_src_buf, iaa_zip_queue_depth},
+    {cpu_zip_compress, cpu_zip_decompress, cpu_zip_wait, cpu_zip_src_buf, cpu_zip_queue_depth},
 };
 
 static const ZipOps &ops(ZipBackend backend) { return kZipOps[static_cast<int>(backend)]; }
@@ -136,63 +136,82 @@ static constexpr size_t kNoTask = static_cast<size_t>(-1);
 static void ensure_zip_init() {
     static std::once_flag flag;
     std::call_once(flag, [] {
-        if (envs.IAXL_QAT_ZIP_ENABLE)
+        if (envs.IAXL_QAT_ZIP_ENABLE) {
             IAXL_CHECK(qat_zip_init() == 0, "kv_zip: qat_zip_init failed");
-        if (envs.IAXL_IAA_ZIP_ENABLE)
+            IAXL_CHECK(envs.IAXL_QAT_INSTANCE_NUM <= qat_zip_num_slots() / qat_zip_queue_depth(),
+                       "kv_zip: IAXL_QAT_INSTANCE_NUM exceeds available QAT instances");
+        }
+        if (envs.IAXL_IAA_ZIP_ENABLE) {
             IAXL_CHECK(iaa_zip_init() == 0, "kv_zip: iaa_zip_init failed");
+            IAXL_CHECK(envs.IAXL_IAA_INSTANCE_NUM <= iaa_zip_num_slots() / iaa_zip_queue_depth(),
+                       "kv_zip: IAXL_IAA_INSTANCE_NUM exceeds available IAA instances");
+        }
         if (envs.IAXL_CPU_ZIP_ENABLE)
             IAXL_CHECK(cpu_zip_init() == 0, "kv_zip: cpu_zip_init failed");
     });
 }
 
+// A backend slot, the item in flight on it and the thread that drives it.
+struct Lane {
+    ZipBackend backend;
+    int slot;
+    size_t item;
+    int owner; // driving thread
+};
+
+struct LanePlan {
+    std::vector<Lane> lanes;
+    int threads;
+};
+
+// Which thread drives which slot depends only on the configuration, so it is planned once.
+static const LanePlan &lane_plan() {
+    static const LanePlan plan = [] {
+        ensure_zip_init();
+        const int qat_workers = envs.IAXL_QAT_ZIP_ENABLE ? envs.IAXL_QAT_INSTANCE_NUM : 0;
+        const int iaa_workers = envs.IAXL_IAA_ZIP_ENABLE ? envs.IAXL_IAA_INSTANCE_NUM : 0;
+        const int cpu_workers = envs.IAXL_CPU_ZIP_ENABLE ? cpu_zip_num_slots() : 0;
+        const int worker_count = qat_workers + iaa_workers + cpu_workers;
+        // Slot k of every worker comes before slot k + 1 of any, so that threads beyond the worker
+        // count split the slots of one worker. The backends keep all request state per slot.
+        std::vector<Lane> all;
+        for (int k = 0;; k++) {
+            const size_t before = all.size();
+            for (int w = 0; w < worker_count; w++) {
+                ZipBackend backend = ZipBackend::CPU;
+                int first = qat_workers + iaa_workers;
+                if (w < qat_workers) {
+                    backend = ZipBackend::QAT;
+                    first = 0;
+                } else if (w < qat_workers + iaa_workers) {
+                    backend = ZipBackend::IAA;
+                    first = qat_workers;
+                }
+                const int depth = ops(backend).queue_depth();
+                if (k < depth)
+                    all.push_back({backend, (w - first) * depth + k, kNoTask, w});
+            }
+            if (all.size() == before)
+                break;
+        }
+        const int threads =
+            static_cast<int>(std::min<size_t>(envs.IAXL_OMP_THREAD_NUM, all.size()));
+        // Up to one thread per worker, each worker stays on one thread so no instance is polled
+        // from two; extra threads take the slots round-robin.
+        for (size_t j = 0; j < all.size(); j++)
+            all[j].owner = threads <= worker_count ? all[j].owner % threads : int(j % threads);
+        return LanePlan{std::move(all), threads};
+    }();
+    return plan;
+}
+
 template <class Next, class Submit, class Complete>
 static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) {
-    ensure_zip_init();
-    const int qat_workers = envs.IAXL_QAT_ZIP_ENABLE ? envs.IAXL_QAT_INSTANCE_NUM : 0;
-    const int iaa_workers = envs.IAXL_IAA_ZIP_ENABLE ? envs.IAXL_IAA_INSTANCE_NUM : 0;
-    const int cpu_workers = envs.IAXL_CPU_ZIP_ENABLE ? cpu_zip_num_slots() : 0;
-    const int worker_count = qat_workers + iaa_workers + cpu_workers;
-    IAXL_CHECK(qat_workers == 0 || qat_workers <= qat_zip_num_slots() / qat_zip_queue_depth(),
-               "kv_zip: IAXL_QAT_INSTANCE_NUM exceeds available QAT instances");
-    IAXL_CHECK(iaa_workers == 0 || iaa_workers <= iaa_zip_num_slots() / iaa_zip_queue_depth(),
-               "kv_zip: IAXL_IAA_INSTANCE_NUM exceeds available IAA instances");
-    struct Lane {
-        ZipBackend backend;
-        int slot;
-        size_t item;
-        int owner; // driving thread
-    };
-    // Slot k of every worker comes before slot k + 1 of any, so that threads beyond the worker
-    // count split the slots of one worker. The backends keep all request state per slot.
-    std::vector<Lane> all;
-    for (int k = 0;; k++) {
-        const size_t before = all.size();
-        for (int w = 0; w < worker_count; w++) {
-            ZipBackend backend = ZipBackend::CPU;
-            int first = qat_workers + iaa_workers;
-            if (w < qat_workers) {
-                backend = ZipBackend::QAT;
-                first = 0;
-            } else if (w < qat_workers + iaa_workers) {
-                backend = ZipBackend::IAA;
-                first = qat_workers;
-            }
-            const int depth = ops(backend).queue_depth();
-            if (k < depth)
-                all.push_back({backend, (w - first) * depth + k, kNoTask, w});
-        }
-        if (all.size() == before)
-            break;
-    }
-    const int threads = static_cast<int>(std::min<size_t>(envs.IAXL_OMP_THREAD_NUM, all.size()));
-    // Up to one thread per worker, each worker stays on one thread so no instance is polled from
-    // two; extra threads take the slots round-robin.
-    for (size_t j = 0; j < all.size(); j++)
-        all[j].owner = threads <= worker_count ? all[j].owner % threads : int(j % threads);
+    const LanePlan &plan = lane_plan();
 
     auto drive = [&](int tid) {
         std::vector<Lane> lanes;
-        for (const Lane &l : all) {
+        for (const Lane &l : plan.lanes) {
             if (l.owner != tid)
                 continue;
             const size_t i = get_next(l.backend);
@@ -214,7 +233,7 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
                     continue;
                 }
                 IAXL_CHECK(status == 0, "kv_zip: zip wait failed");
-                complete(lane.backend, lane.item, out, out_len);
+                complete(lane.backend, lane.slot, lane.item, out, out_len);
 
                 lane.item = get_next(lane.backend);
                 if (lane.item == kNoTask) {
@@ -228,14 +247,14 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
         }
     };
 
-    parallel::run_threads(threads, drive);
+    parallel::run_threads(plan.threads, drive);
 }
 
 // Compression state of one tensor. Segments finishing while others are still in flight park their
-// streams over their own bytes in the tensor, and the last one to finish assembles the block.
+// payloads over their own bytes in the tensor, and the last one to finish assembles the block.
 struct ZipBlock {
-    char *data = nullptr; // tensor bytes, prepared in place one segment at a time
-    int element_size = 0;
+    char *data = nullptr;   // tensor bytes
+    uint16_t mask = 0xFFFF; // lossy truncation
     BlockHeader header{};
     uint32_t first = 0; // position of segment 0 in the batch's segment list
     std::atomic<uint32_t> pending{0};
@@ -288,9 +307,14 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
         const auto &t = tensors[i];
         ZipBlock &b = blocks[i];
         b.data = static_cast<char *>(t.data_ptr());
-        b.element_size = static_cast<int>(t.element_size());
+        b.mask = lossy_mask(static_cast<int>(t.element_size()));
         const bool shuffle = data_shuffle_enabled() && t.dtype() == torch::kBFloat16;
         b.header = make_header(orig_sizes[i], shuffle ? kBlockShuffled : 0);
+        // Segments are prepared in the backends' input buffers. The last one is the longest.
+        IAXL_CHECK(segment_length(b.header, b.header.segments - 1) <=
+                       static_cast<uint32_t>(envs.IAXL_ZIP_SRC_CAP),
+                   "kv_zip: segment exceeds IAXL_ZIP_SRC_CAP; raise it or set "
+                   "IAXL_ZIP_SEGMENT_SIZE_KB");
         b.first = static_cast<uint32_t>(segs.size());
         b.pending.store(b.header.segments, std::memory_order_relaxed);
         for (uint32_t k = 0; k < b.header.segments; k++)
@@ -298,8 +322,8 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
     }
     std::vector<SegmentEntry> entries(segs.size());
 
-    // `stream` is set when segment `last` was not parked in the tensor.
-    auto assemble = [&](uint32_t i, uint32_t last, const char *stream) {
+    // `payload` is set when segment `last` was not parked in the tensor.
+    auto assemble = [&](uint32_t i, uint32_t last, const char *payload) {
         ZipBlock &b = blocks[i];
         const BlockHeader &h = b.header;
         SegmentEntry *table = &entries[b.first];
@@ -310,7 +334,8 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
         IAXL_CHECK(buf != nullptr, "kv_zip: cache buffer allocation failed");
         size_t offset = payload_start(h.segments);
         for (uint32_t k = 0; k < h.segments; k++) {
-            const char *src = (k == last && stream) ? stream : b.data + size_t(k) * h.segment_size;
+            const char *src =
+                (k == last && payload) ? payload : b.data + size_t(k) * h.segment_size;
             memcpy(buf + offset, src, table[k].length);
             table[k].offset = static_cast<uint32_t>(offset);
             offset += table[k].length;
@@ -329,39 +354,39 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
         },
         [&](ZipBackend backend, int slot, size_t s) {
             const SegmentRef r = segs[s];
-            ZipBlock &b = blocks[r.block];
-            char *src = b.data + size_t(r.index) * b.header.segment_size;
+            const ZipBlock &b = blocks[r.block];
+            const char *src = b.data + size_t(r.index) * b.header.segment_size;
             const uint32_t len = segment_length(b.header, r.index);
-            IAXL_CHECK(len <= static_cast<uint32_t>(ops(backend).src_cap()),
-                       "kv_zip: segment exceeds IAXL_ZIP_SRC_CAP; raise it or set "
-                       "IAXL_ZIP_SEGMENT_SIZE_KB");
-            lossy_trunc(src, len, b.element_size);
-            data_shuffle(src, len, true, (b.header.flags & kBlockShuffled) != 0);
-            const int status = ops(backend).compress(slot, src, static_cast<int>(len));
+            char *in = static_cast<char *>(ops(backend).src_buf(slot));
+            if (b.header.flags & kBlockShuffled)
+                shuffle_copy(in, src, len, b.mask);
+            else
+                masked_copy(in, src, len, b.mask);
+            const int status = ops(backend).compress(slot, in, static_cast<int>(len));
             IAXL_CHECK(status == 0, "kv_zip: zip compress failed");
         },
-        [&](ZipBackend backend, size_t s, void *out, int out_len) {
+        [&](ZipBackend backend, int slot, size_t s, void *out, int out_len) {
             const SegmentRef r = segs[s];
             ZipBlock &b = blocks[r.block];
             const uint32_t len = segment_length(b.header, r.index);
-            const char *stream = static_cast<const char *>(out);
+            const char *payload = static_cast<const char *>(out);
             if (static_cast<uint32_t>(out_len) < len) {
                 entries[s] = {0, static_cast<uint32_t>(out_len),
                               backend == ZipBackend::IAA ? kSegmentIaa : 0u};
             } else {
-                // Not compressible: keep the prepared bytes, which are still in the tensor.
+                // Not compressible: store the prepared segment, still in the input buffer.
                 entries[s] = {0, len, kSegmentStored};
-                stream = nullptr;
+                payload = static_cast<const char *>(ops(backend).src_buf(slot));
             }
             if (b.pending.load(std::memory_order_acquire) > 1) {
-                // The segment's input is already consumed and the stream is shorter than it.
-                if (stream)
-                    memcpy(b.data + size_t(r.index) * b.header.segment_size, stream, out_len);
+                // The segment's bytes in the tensor were read at submit and are not shorter.
+                memcpy(b.data + size_t(r.index) * b.header.segment_size, payload,
+                       entries[s].length);
                 if (b.pending.fetch_sub(1, std::memory_order_acq_rel) > 1)
                     return;
-                stream = nullptr;
+                payload = nullptr;
             }
-            assemble(r.block, r.index, stream);
+            assemble(r.block, r.index, payload);
         });
 }
 
@@ -398,8 +423,10 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
                    "kv_zip: decompressed size does not match segment size");
         char *dst = static_cast<char *>(tensors[r.block].data_ptr()) +
                     size_t(r.index) * h.segment_size;
-        memcpy(dst, src, len);
-        data_shuffle(dst, len, true, (h.flags & kBlockShuffled) != 0);
+        if (h.flags & kBlockShuffled)
+            shuffle_copy(dst, static_cast<const char *>(src), len);
+        else
+            memcpy(dst, src, len);
     };
 
     parallel::parallel_for(stored.size(), [&](size_t j) {
@@ -436,7 +463,7 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
             const int status = ops(backend).decompress(slot, payload, static_cast<int>(e.length));
             IAXL_CHECK(status == 0, "kv_zip: zip decompress failed");
         },
-        [&](ZipBackend, size_t s, void *out, int out_len) {
+        [&](ZipBackend, int, size_t s, void *out, int out_len) {
             place(segs[s], out, static_cast<size_t>(out_len));
         });
 }
