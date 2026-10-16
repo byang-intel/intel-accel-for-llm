@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 #
-# Finds the best IAXL_ZIP_SEGMENT_SIZE_KB for QAT and IAA. For every segment size from 16 KiB to
+# Sweeps IAXL_ZIP_SEGMENT_SIZE_KB for QAT and IAA. For every segment size from 16 KiB to
 # 1 MiB, plus whole blocks (0), it runs the KVStore benchmark with one backend at a time and
 # prints the compression ratio, compress and decompress throughput. Run inside the dev container.
-#
-# The best size has the highest throughput in its slower direction, min(zip, unzip), which bounds
-# the KV cache traffic. Sizes within 3% of the best count as a tie, and the largest of them wins
-# because larger segments compress better. With both backends, the suggestion maximizes the lower
-# of the two scores, each relative to that backend's best.
 #
 # Usage: benchmark/kvstore/kvstore_segment_sweep.sh [options] [-- kvstore_benchmark.py options]
 #   --backends LIST   qat, iaa or qat,iaa (default qat,iaa)
@@ -32,7 +27,7 @@ DATA_SOURCE=mock
 EXTRA=()
 
 usage() {
-    sed -n 's/^# \{0,1\}//; 12,19p' "${BASH_SOURCE[0]}"
+    sed -n 's/^# \{0,1\}//; 7,14p' "${BASH_SOURCE[0]}"
     exit "${1:-0}"
 }
 
@@ -116,18 +111,6 @@ done
 echo
 
 awk -v block="$BLOCK_KB" -v backends="$BACKENDS" '
-# Largest segment within 3% of the best score; 0 (whole block) counts as the largest.
-function pick(scores, rows, n,    i, best, cand, key) {
-    best = 0
-    for (i = 1; i <= n; i++) if (rows[i] in scores && scores[rows[i]] > best) best = scores[rows[i]]
-    cand = ""
-    for (i = 1; i <= n; i++) {
-        key = rows[i]
-        if (!(key in scores) || scores[key] < 0.97 * best) continue
-        if (cand == "" || key == 0 || (cand != 0 && key + 0 > cand + 0)) cand = key
-    }
-    return cand
-}
 {
     key = $1 SUBSEP $2
     if (!(($2) in seen)) { seen[$2] = 1; rows[++nrows] = $2 }
@@ -141,32 +124,13 @@ END {
         printf "%s\n", toupper(be)
         printf "| Segment KiB | Ratio  | Zip GB/s | Unzip GB/s |\n"
         printf "|-------------|--------|----------|------------|\n"
-        delete sc
         for (i = 1; i <= nrows; i++) {
             s = rows[i]; key = be SUBSEP s
             label = s == 0 ? sprintf("0 (%d)", block) : s
             if (!n[key]) { printf "| %-11s | failed |          |            |\n", label; continue }
             r = ratio[key] / n[key]; z = zip[key] / n[key]; u = unzip[key] / n[key]
-            sc[s] = z < u ? z : u; score[be, s] = sc[s]
             printf "| %-11s | %.3fx | %8.2f | %10.2f |\n", label, r, z, u
         }
-        for (s in sc) if (sc[s] > top[be]) top[be] = sc[s]
         print ""
     }
-    # Backends share one segment size: maximize the worst of the relative throughputs.
-    delete sc
-    for (i = 1; i <= nrows; i++) {
-        s = rows[i]; m = 2
-        for (b = 1; b <= nb; b++) {
-            if (!((bl[b], s) in score) || !top[bl[b]]) { m = -1; break }
-            v = score[bl[b], s] / top[bl[b]]
-            if (v < m) m = v
-        }
-        if (m >= 0) sc[s] = m
-    }
-    s = pick(sc, rows, nrows)
-    if (s == "") { print "No size succeeded on every backend."; exit }
-    printf "Suggestion: export IAXL_ZIP_SEGMENT_SIZE_KB=%s", s
-    if (nb > 1) printf " (each backend at >= %.0f%% of its best)", sc[s] * 100
-    print ""
 }' "$RESULTS"
