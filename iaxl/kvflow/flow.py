@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import time
 import torch
 import logging
 from typing import Dict, Optional, List, Tuple, Any
@@ -159,12 +160,19 @@ class KVFlow:
                 _iqt.rdma_register_local(pool.data_ptr(), pool.nbytes, self.chunk_pool.block_bytes)
 
     def _allocate(self, count: int, shape: Tuple[int, ...], dtype: torch.dtype) -> List[torch.Tensor]:
+        rounds, start = 0, 0.0
         while (tensors := self.chunk_pool.allocate(count, shape, dtype)) is None:
             if not (self._pending_puts or self._pending_gets):
                 raise RuntimeError(f"ScratchPool exhausted: need {count}, {self.chunk_pool.status()}")
+            if rounds == 1:
+                start = time.perf_counter()
+            rounds += 1
             for wait_fn, pending in ((self.put_wait, self._pending_puts), (self.get_wait, self._pending_gets)):
                 for task in list(pending.values()):
                     wait_fn({task.tensor_key: task}, wait=False)
+        if rounds > 1:
+            logger.warning("ScratchPool exhausted: waited %.3f ms (%d rounds) for %d blocks",
+                           (time.perf_counter() - start) * 1e3, rounds, count)
         return tensors
 
     def _create_ctx(self, tensor, chunk_dim, direction, description, work_stream):
