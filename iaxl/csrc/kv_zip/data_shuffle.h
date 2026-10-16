@@ -34,13 +34,14 @@ inline void masked_copy(char *__restrict dst, const char *__restrict src, size_t
 // Copies a bf16 buffer with every element ANDed with `mask`, moving the high bytes into the first
 // half and the low bytes into the second. Shuffling the result again restores the input. The
 // byte order is persisted in compressed blocks, so it must not change.
-inline void shuffle_copy(char *__restrict dst, const char *__restrict src, size_t size,
-                         uint16_t mask = 0xFFFF) {
+// The source is split: its first size / 2 bytes at `a`, the rest at `b`.
+inline void shuffle_copy(char *__restrict dst, const char *__restrict a, const char *__restrict b,
+                         size_t size, uint16_t mask = 0xFFFF) {
     const size_t half = size / 2, n = size / 4;
     // With an odd half, every word of the second half straddles two elements.
     const uint16_t mask_b = half % 2 ? __builtin_bswap16(mask) : mask;
-    const auto *sa = reinterpret_cast<const unaligned_u16 *>(src);
-    const auto *sb = reinterpret_cast<const unaligned_u16 *>(src + half);
+    const auto *sa = reinterpret_cast<const unaligned_u16 *>(a);
+    const auto *sb = reinterpret_cast<const unaligned_u16 *>(b);
     auto *da = reinterpret_cast<unaligned_u16 *>(dst);
     auto *db = reinterpret_cast<unaligned_u16 *>(dst + half);
     for (size_t i = 0; i < n; i++) {
@@ -50,9 +51,14 @@ inline void shuffle_copy(char *__restrict dst, const char *__restrict src, size_
     }
     // Bytes the loop leaves in place when size is not a multiple of 4.
     for (size_t o = 2 * n; o < half; o++)
-        dst[o] = static_cast<char>(src[o] & (o % 2 ? mask >> 8 : mask));
+        dst[o] = static_cast<char>(a[o] & (o % 2 ? mask >> 8 : mask));
     for (size_t o = half + 2 * n; o < size; o++)
-        dst[o] = static_cast<char>(src[o] & (o % 2 ? mask >> 8 : mask));
+        dst[o] = static_cast<char>(b[o - half] & (o % 2 ? mask >> 8 : mask));
+}
+
+inline void shuffle_copy(char *__restrict dst, const char *src, size_t size,
+                         uint16_t mask = 0xFFFF) {
+    shuffle_copy(dst, src, src + size / 2, size, mask);
 }
 
 } // namespace kv_zip

@@ -89,7 +89,7 @@ A block is a `BlockHeader`, then one `SegmentEntry` per segment, then the payloa
 | `BlockHeader` field | Content |
 | --- | --- |
 | `magic`, `version` | `"IAXZ"` and `1`. Blocks without them, such as caches persisted by older versions with the former 8-byte header, are rejected. |
-| `flags` | `kBlockShuffled`: each segment was BF16-shuffled on its own before compression |
+| `flags` | `kBlockShuffled`: each segment was BF16-shuffled on its own before compression; `kBlockExponentOnly`: only the first (high-byte, sign and exponent) half of each shuffled segment was compressed, and the second half follows the stream raw. Compression sets it when `IAXL_ZIP_EXPONENT_ONLY=1`; decompression always reads it |
 | `orig_size` | Tensor size in bytes |
 | `segment_size` | Bytes per segment, or `orig_size` when the tensor is one segment; the last segment also takes the remainder. Decompression reads it from the block, not from `IAXL_ZIP_SEGMENT_SIZE_KB` |
 | `segments` | Number of `SegmentEntry` records |

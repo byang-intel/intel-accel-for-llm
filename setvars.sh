@@ -82,6 +82,7 @@ printf '%s\n' \
 # ---- Cache / compression ----------------------------------------------------
 export IAXL_KV_LOSSY_TRUNC=${IAXL_KV_LOSSY_TRUNC:-0}                     # Lossy LSB truncation: 'auto', 0 (off), or N bits
 export IAXL_KV_DATA_SHUFFLE=${IAXL_KV_DATA_SHUFFLE:-1}                   # Byte-shuffle before compression (0/1)
+export IAXL_ZIP_EXPONENT_ONLY=${IAXL_ZIP_EXPONENT_ONLY:-$IAXL_KV_DATA_SHUFFLE} # With shuffle, compress only the BF16 high (sign/exponent) bytes and store the low bytes raw (0/1)
 export IAXL_ZIP_LEVEL=${IAXL_ZIP_LEVEL:-1}                               # Compression level 1-9: higher = better ratio, slower
 export IAXL_ZIP_SRC_CAP=${IAXL_ZIP_SRC_CAP:-4194304}                     # Source/decompressed block capacity (4 MiB)
 export IAXL_ZIP_DST_CAP=${IAXL_ZIP_DST_CAP:-4194304}                     # Compressed-output capacity (4 MiB)
