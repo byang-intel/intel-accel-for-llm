@@ -157,6 +157,11 @@ class KVStoreLocal:
             mgmt_register("GET", "/v1/cache/status", lambda params, s=self: s.status())
             mgmt_register(
                 "GET",
+                "/v1/cache/simple_status",
+                lambda params, s=self: s.simple_status(),
+            )
+            mgmt_register(
+                "GET",
                 "/v1/health",
                 lambda params, s=self: {"status": "ok", "rank": s.rank},
             )
@@ -396,7 +401,7 @@ class KVStoreLocal:
         last_evict_check = time.monotonic()
         while not self._monitor_stop.wait(self._MONITOR_INTERVAL_S):
             st = self._controller.broadcast(
-                lambda c: c.get("/v1/cache/status"), ranks=[0]
+                lambda c: c.get("/v1/cache/simple_status"), ranks=[0]
             )["0"]
             if "error" in st:
                 raise RuntimeError(f"DDR pool status failed: {st}")
@@ -451,11 +456,23 @@ class KVStoreLocal:
         status["rank"] = self.rank
         status["num_layers"] = len(self.layer_names)
         status["kvcache_shape"] = self.kvcache_shape
-        # Host-level figures from the worker's node (the scheduler may run elsewhere).
-        vm = psutil.virtual_memory()
-        status["host_mem_used_bytes"] = vm.used
-        status["host_mem_total_bytes"] = vm.total
         return status
+
+    def simple_status(self) -> dict:
+        # Just what _monitor_loop needs; skips the O(n) unpersisted_count walk of status().
+        mem = self.tensorzip.mem
+        vm = psutil.virtual_memory()
+        return {
+            "rank": self.rank,
+            "current_bytes": mem.current_bytes,
+            "capacity_bytes": mem.capacity_bytes,
+            "group_count": mem.group_count,
+            "total_zip_bytes": mem.total_zip_bytes,
+            "total_unzip_bytes": mem.total_unzip_bytes,
+            "evictions": mem.evictions,
+            "host_mem_used_bytes": vm.used,
+            "host_mem_total_bytes": vm.total,
+        }
 
     def metrics(self, params: Optional[dict] = None) -> dict:
         from ..torch_ext import (
