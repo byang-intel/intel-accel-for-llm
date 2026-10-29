@@ -97,10 +97,10 @@ export IAXL_PREALLOC_LIMIT=${IAXL_PREALLOC_LIMIT:-0}                     # Cap p
 export IAXL_SCRATCH_POOL_SIZE_GB=${IAXL_SCRATCH_POOL_SIZE_GB:-8}         # Pinned scratch pool (GPU<->CPU staging) size in GB
 export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS:-1} # Store the first N KV layers without compression
 # export IAXL_DDR_POOL_SIZE_GB=...         # DDR (host) cache pool size in GB (unset = 1/10 of RAM)
-export IAXL_DDR_POOL_EVICT_HIGH_WATERMARK=${IAXL_DDR_POOL_EVICT_HIGH_WATERMARK:-0.95} # Scheduler evicts LRU groups once the DDR pool reaches this usage ratio
-export IAXL_DDR_POOL_EVICT_LOW_WATERMARK=${IAXL_DDR_POOL_EVICT_LOW_WATERMARK:-0.3}    # ... until usage drops to about this ratio
+export IAXL_DDR_POOL_EVICT_HIGH_WATERMARK=${IAXL_DDR_POOL_EVICT_HIGH_WATERMARK:-0.90} # Scheduler evicts LRU groups once the DDR pool reaches this usage ratio
+export IAXL_DDR_POOL_EVICT_LOW_WATERMARK=${IAXL_DDR_POOL_EVICT_LOW_WATERMARK:-0.5}    # ... until usage drops to about this ratio
 export IAXL_DDR_POOL_EVICT_LEASE_S=${IAXL_DDR_POOL_EVICT_LEASE_S:-300}               # Groups hit by has() within this many seconds are never evicted; must exceed has() -> last load/save of a request
-export IAXL_DDR_POOL_EVICT_INTERVAL_S=${IAXL_DDR_POOL_EVICT_INTERVAL_S:-60}          # How often the scheduler checks DDR pool usage
+export IAXL_DDR_POOL_EVICT_INTERVAL_S=${IAXL_DDR_POOL_EVICT_INTERVAL_S:-30}          # How often the scheduler checks DDR pool usage
 
 # ---- Intel QAT (compression accelerator) ------------------------------------
 export IAXL_QAT_DEVICES=${IAXL_QAT_DEVICES:-0}                                   # Comma-separated QAT device indices, e.g. "0,1"
