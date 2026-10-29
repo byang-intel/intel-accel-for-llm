@@ -111,12 +111,14 @@ sequenceDiagram
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `IAXL_DDR_POOL_EVICT_HIGH_WATERMARK` | 0.80 | Eviction starts when `current_bytes / capacity_bytes` reaches this ratio |
+| `IAXL_DDR_POOL_TOTAL_SIZE_GB` | 80% of host RAM | DDR pool budget across all ranks, in whole GB. `setvars.sh` lowers it so that no rank exceeds 80% of one NUMA node (`host RAM / node count`), i.e. `min(0.8 × RAM, NUM_WORKERS × 0.8 × RAM / nodes)` |
+| `IAXL_DDR_POOL_SIZE_GB` | `TOTAL / NUM_WORKERS` | Per-rank pool capacity; `capacity_bytes` in the formulas below. Without `setvars.sh` the Python fallback is 1/10 of available RAM |
+| `IAXL_DDR_POOL_EVICT_HIGH_WATERMARK` | 0.90 | Eviction starts when `current_bytes / capacity_bytes` reaches this ratio |
 | `IAXL_DDR_POOL_EVICT_LOW_WATERMARK` | 0.5 | Target usage after one eviction pass |
 | `IAXL_DDR_POOL_EVICT_LEASE_S` | 300 | Groups hit by `has()` within this many seconds are never evicted; must exceed `has()` → last load/save of a request |
 | `IAXL_DDR_POOL_EVICT_INTERVAL_S` | 30 | How often the scheduler checks the pool usage |
 
-`capacity_bytes == 0` means an unlimited pool and disables the check. All four variables take effect on the node that runs the scheduler (the daemon node under remote pool), like `IAXL_DDR_POOL_SIZE_GB`.
+Defaults are those set by `setvars.sh`; the sizing helpers live in `tools/auto_config.sh` (`ddr_pool_total_size_gb`). `capacity_bytes == 0` means an unlimited pool and disables the check. The four `EVICT_*` variables take effect on the node that runs the scheduler (the daemon node under remote pool), like `IAXL_DDR_POOL_SIZE_GB`.
 
 ### Deployment forms
 

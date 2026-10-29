@@ -445,6 +445,32 @@ env_truthy() {
     return 1
 }
 
+# Default DDR pool budget across all ranks in GB: 80% of host RAM, lowered so that each of the
+# num_workers ranks gets at most 80% of one NUMA node (host RAM / node count).
+ddr_pool_total_size_gb() {
+    local num_workers=$1
+    local mem_kb num_nodes
+
+    if ! [[ "$num_workers" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: worker count must be a positive integer" >&2
+        return 1
+    fi
+    mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+    if ! [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: cannot read MemTotal from /proc/meminfo" >&2
+        return 1
+    fi
+    num_nodes=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
+    ((num_nodes > 0)) || num_nodes=1
+
+    awk -v n="$num_workers" -v kb="$mem_kb" -v nodes="$num_nodes" 'BEGIN {
+        total = kb / 1024 / 1024 * 0.8
+        numa_cap = total / nodes
+        rank_cap = (total / n < numa_cap) ? total / n : numa_cap
+        printf "%d", rank_cap * n
+    }'
+}
+
 omp_thread_count() {
     local qat_threads=$1
     local cpu_zip_threads=$2

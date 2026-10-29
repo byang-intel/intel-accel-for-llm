@@ -96,7 +96,10 @@ export IAXL_CACHE_CACHEGROUP_NUM=${IAXL_CACHE_CACHEGROUP_NUM:-100000}    # Reser
 export IAXL_PREALLOC_LIMIT=${IAXL_PREALLOC_LIMIT:-0}                     # Cap pinned scratch-pool pre-allocation (0 = unlimited)
 export IAXL_SCRATCH_POOL_SIZE_GB=${IAXL_SCRATCH_POOL_SIZE_GB:-8}         # Pinned scratch pool (GPU<->CPU staging) size in GB
 export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS:-1} # Store the first N KV layers without compression
-# export IAXL_DDR_POOL_SIZE_GB=...         # DDR (host) cache pool size in GB (unset = 1/10 of RAM)
+IAXL_DDR_POOL_TOTAL_SIZE_GB="${IAXL_DDR_POOL_TOTAL_SIZE_GB:-$(ddr_pool_total_size_gb "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
+export IAXL_DDR_POOL_TOTAL_SIZE_GB # DDR (host) cache pool budget across all ranks in GB (default 80% of host RAM, each rank limited to 80% of one NUMA node)
+IAXL_DDR_POOL_SIZE_GB="${IAXL_DDR_POOL_SIZE_GB:-$((IAXL_DDR_POOL_TOTAL_SIZE_GB / NUM_WORKERS))}"
+export IAXL_DDR_POOL_SIZE_GB # Per-rank DDR pool size in GB (default TOTAL / NUM_WORKERS)
 export IAXL_DDR_POOL_EVICT_HIGH_WATERMARK=${IAXL_DDR_POOL_EVICT_HIGH_WATERMARK:-0.90} # Scheduler evicts LRU groups once the DDR pool reaches this usage ratio
 export IAXL_DDR_POOL_EVICT_LOW_WATERMARK=${IAXL_DDR_POOL_EVICT_LOW_WATERMARK:-0.5}    # ... until usage drops to about this ratio
 export IAXL_DDR_POOL_EVICT_LEASE_S=${IAXL_DDR_POOL_EVICT_LEASE_S:-300}               # Groups hit by has() within this many seconds are never evicted; must exceed has() -> last load/save of a request
