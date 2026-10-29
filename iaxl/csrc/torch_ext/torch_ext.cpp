@@ -288,6 +288,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("max_groups"))
 
         .def(
+            "evict_labels",
+            [](kv_pool::Mem &self, const std::vector<std::string> &group_keys) {
+                py::gil_scoped_release release;
+                self.evict_labels(group_keys);
+            },
+            "Unlink the given groups and free them in the background", py::arg("group_keys"))
+
+        .def(
             "set_evict_enabled",
             [](kv_pool::Mem &self, bool enabled) { self.set_evict_enabled(enabled); },
             "Enable/disable eviction (for safe pointer access periods)", py::arg("enabled"))
@@ -431,6 +439,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             },
             "Submit group_keys to record (async, thread-safe)", py::arg("label"),
             py::arg("chunk_labels"))
+        .def(
+            "touch",
+            [](kv_pool::Record &self, const std::string &label,
+               const std::vector<std::string> &chunk_labels) {
+                py::gil_scoped_release release;
+                self.touch(label, chunk_labels);
+            },
+            "Set last_access of the given chunks to now (async)", py::arg("label"),
+            py::arg("chunk_labels"))
+        .def(
+            "evict",
+            [](kv_pool::Record &self, double after, double before, size_t max_count) {
+                py::gil_scoped_release release;
+                return self.evict(after, before, max_count);
+            },
+            "Select the oldest DDR-resident groups and drop their unpersisted rows",
+            py::arg("after"), py::arg("before"), py::arg("max_count"))
         .def(
             "remove",
             [](kv_pool::Record &self, const std::vector<std::string> &chunk_labels) {

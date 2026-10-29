@@ -24,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -235,6 +236,29 @@ class Mem::Impl {
         wait_deletion_guard();
         std::lock_guard<std::mutex> lock(mutex_);
         return evict_groups_unlocked(max_groups);
+    }
+
+    // Unlinks the groups now; their buffers are freed on a background thread.
+    void evict_labels(const std::vector<std::string> &group_keys) {
+        std::vector<std::unordered_map<std::string, SubEntry>> detached;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto &group_key : group_keys) {
+                auto it = cache_.find(group_key);
+                if (it == cache_.end())
+                    continue;
+                EntryGroup &group = it->second;
+                current_bytes_ -= group.total_bytes();
+                total_entries_ -= group.entry_count();
+                lru_remove(&group);
+                unpersisted_remove(&group);
+                detached.push_back(std::move(group.entries));
+                cache_.erase(it);
+                evictions_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!detached.empty())
+            std::thread([d = std::move(detached)]() mutable { d.clear(); }).detach();
     }
 
     void put_unlocked(const std::vector<std::string> &keys, std::vector<char *> &&data_ptrs,
@@ -879,6 +903,10 @@ std::vector<std::tuple<std::string, size_t>> Mem::persist_groups(size_t max_grou
 
 std::vector<std::tuple<std::string, size_t>> Mem::evict_groups(size_t max_groups) {
     return impl_->evict_groups(max_groups);
+}
+
+void Mem::evict_labels(const std::vector<std::string> &group_keys) {
+    impl_->evict_labels(group_keys);
 }
 
 size_t Mem::evict_to_size(size_t target_bytes) { return impl_->evict_to_size(target_bytes); }

@@ -44,6 +44,11 @@ def _float_or_none(name: str) -> Optional[float]:
         return None
 
 
+def _float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    return float(v) if v else default  # an invalid value raises ValueError
+
+
 class Envs:
     def __init__(self) -> None:
         self.IAXL_DEBUG = _bool("IAXL_DEBUG")
@@ -69,6 +74,16 @@ class Envs:
         )
 
         self.IAXL_DDR_POOL_SIZE_GB = _float_or_none("IAXL_DDR_POOL_SIZE_GB")
+        self.IAXL_DDR_POOL_EVICT_HIGH_WATERMARK = _float("IAXL_DDR_POOL_EVICT_HIGH_WATERMARK", 0.95)
+        self.IAXL_DDR_POOL_EVICT_LOW_WATERMARK = _float("IAXL_DDR_POOL_EVICT_LOW_WATERMARK", 0.3)
+        self.IAXL_DDR_POOL_EVICT_LEASE_S = _float("IAXL_DDR_POOL_EVICT_LEASE_S", 300)
+        self.IAXL_DDR_POOL_EVICT_INTERVAL_S = _float("IAXL_DDR_POOL_EVICT_INTERVAL_S", 60)
+        if not 0 <= self.IAXL_DDR_POOL_EVICT_LOW_WATERMARK < self.IAXL_DDR_POOL_EVICT_HIGH_WATERMARK <= 1:
+            raise ValueError(
+                "IAXL_DDR_POOL_EVICT_LOW/HIGH_WATERMARK must satisfy 0 <= LOW < HIGH <= 1"
+            )
+        if self.IAXL_DDR_POOL_EVICT_LEASE_S <= 0 or self.IAXL_DDR_POOL_EVICT_INTERVAL_S <= 0:
+            raise ValueError("IAXL_DDR_POOL_EVICT_LEASE_S/INTERVAL_S must be > 0")
         self.IAXL_SCRATCH_POOL_SIZE_GB = _int("IAXL_SCRATCH_POOL_SIZE_GB", 8)
 
         self.IAXL_PREALLOC_LIMIT = _int("IAXL_PREALLOC_LIMIT", 0)

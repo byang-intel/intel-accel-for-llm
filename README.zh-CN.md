@@ -132,27 +132,32 @@ docker exec -it -w "$PWD" iaxl.vllm bash
 
 ## REST API
 
-管理接口默认监听 `localhost:18700`，并将请求转发到各个 rank。
+管理接口默认监听 `localhost:18700`，并将请求转发到各个 rank；`evict` 由 controller 自己处理，不转发。
 
 | 接口 | 说明 |
 | --- | --- |
 | `GET /v1/cache/status` | 查询 cache 状态 |
-| `POST /v1/cache/evict` | 从 DDR 中淘汰 cache |
+| `POST /v1/cache/evict` | 打开或关闭 DDR 自动淘汰（默认打开） |
 | `POST /v1/cache/persist` | 将 cache 持久化到磁盘 |
 
 ```bash
 curl http://localhost:18700/v1/cache/status
 ```
 
-`persist` 和 `evict` 通过 `count` 指定最多处理的 cache group 数量。需要保留 cache 数据时，先调用 `persist`，再调用 `evict`：
+DDR 用量达到 `IAXL_DDR_POOL_EVICT_HIGH_WATERMARK`（默认 0.95）时，scheduler 自动淘汰最久未使用的 cache group，降到约 `IAXL_DDR_POOL_EVICT_LOW_WATERMARK`（默认 0.3）。`evict` 接受 `{"enable": true|false}`，返回 `{"auto_evict": ...}`；不带 `enable` 只查询当前状态。关闭请求在进行中的淘汰结束后才返回。
+
+`persist` 通过 `count` 指定最多处理的 cache group 数量。淘汰会丢弃未持久化的 cache group，需要完整保留 cache 时，先暂停淘汰，再 `persist`，最后恢复：
 
 ```bash
+curl -X POST http://localhost:18700/v1/cache/evict \
+	-H 'Content-Type: application/json' \
+	-d '{"enable":false}'
 curl -X POST http://localhost:18700/v1/cache/persist \
 	-H 'Content-Type: application/json' \
 	-d '{"count":999999}'
 curl -X POST http://localhost:18700/v1/cache/evict \
 	-H 'Content-Type: application/json' \
-	-d '{"count":999999}'
+	-d '{"enable":true}'
 ```
 
 ## 跨节点 KV Cache 复用

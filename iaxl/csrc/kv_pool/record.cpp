@@ -45,7 +45,8 @@ namespace kv_pool {
 namespace {
 
 double now_seconds() {
-    auto now = std::chrono::steady_clock::now();
+    // Wall clock: comparable with Python time.time() and across restarts.
+    auto now = std::chrono::system_clock::now();
     return std::chrono::duration<double>(now.time_since_epoch()).count();
 }
 
@@ -71,9 +72,10 @@ class Record::Impl {
 
         const char *create_sql = "CREATE TABLE IF NOT EXISTS chunks ("
                                  "  chunk_label TEXT PRIMARY KEY,"
-                                 "  created_at REAL,"
+                                 "  last_access REAL,"
                                  "  persisted INTEGER DEFAULT 0"
-                                 ")";
+                                 ");"
+                                 "CREATE INDEX IF NOT EXISTS chunks_lru ON chunks(last_access)";
         rc = sqlite3_exec(db_, create_sql, nullptr, nullptr, nullptr);
         if (rc != SQLITE_OK) {
             std::string err =
@@ -94,7 +96,7 @@ class Record::Impl {
         }
 
         const char *insert_sql =
-            "INSERT OR REPLACE INTO chunks (chunk_label, created_at, persisted) VALUES (?, ?, 0)";
+            "INSERT OR REPLACE INTO chunks (chunk_label, last_access, persisted) VALUES (?, ?, 0)";
         SQLITE_CHECK(sqlite3_prepare_v2(db_, insert_sql, -1, &stmt_, nullptr));
 
         queue_.init();
@@ -127,6 +129,81 @@ class Record::Impl {
         });
 
         track_future_locked(std::move(future));
+    }
+
+    // Async like submit(); rows that do not exist are left alone.
+    void touch(const std::string &label, const std::vector<std::string> &chunk_labels) {
+        if (chunk_labels.empty())
+            return;
+        std::lock_guard<std::mutex> lock(operation_mutex_);
+        auto future = queue_.submit([this, group_keys = make_group_keys(label, chunk_labels)]() {
+            const double now = now_seconds();
+            sqlite3_stmt *stmt = nullptr;
+            SQLITE_CHECK(sqlite3_prepare_v2(
+                db_, "UPDATE chunks SET last_access = ? WHERE chunk_label = ?", -1, &stmt, nullptr));
+            SQLITE_CHECK(sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr));
+            for (const auto &gk : group_keys) {
+                sqlite3_reset(stmt);
+                sqlite3_bind_double(stmt, 1, now);
+                sqlite3_bind_text(stmt, 2, gk.c_str(), -1, SQLITE_TRANSIENT);
+                SQLITE_CHECK_DONE(sqlite3_step(stmt));
+            }
+            SQLITE_CHECK(sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr));
+            sqlite3_finalize(stmt);
+        });
+        track_future_locked(std::move(future));
+    }
+
+    // Rows with last_access > after are DDR-resident; returns the evicted group keys and the new cut.
+    std::pair<std::vector<std::string>, double> evict(double after, double before, size_t max_count) {
+        std::lock_guard<std::mutex> lock(operation_mutex_);
+        sync_locked();
+        assert(db_ && "[Record] db_ must not be null");
+
+        // Rows sharing the cut timestamp are selected together (see kvstore.py evicted_until).
+        const char *until_sql = "SELECT MAX(last_access) FROM "
+                                "(SELECT last_access FROM chunks "
+                                " WHERE last_access > ? AND last_access < ? "
+                                " ORDER BY last_access LIMIT ?)";
+        const char *select_sql =
+            "SELECT chunk_label FROM chunks WHERE last_access > ? AND last_access <= ?";
+        const char *delete_sql = "DELETE FROM chunks "
+                                 "WHERE last_access > ? AND last_access <= ? AND persisted = 0";
+
+        SQLITE_CHECK(sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr));
+
+        sqlite3_stmt *stmt = nullptr;
+        SQLITE_CHECK(sqlite3_prepare_v2(db_, until_sql, -1, &stmt, nullptr));
+        sqlite3_bind_double(stmt, 1, after);
+        sqlite3_bind_double(stmt, 2, before);
+        sqlite3_bind_int64(stmt, 3, (sqlite3_int64)max_count);
+        double until = after;
+        if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+            until = sqlite3_column_double(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+
+        std::vector<std::string> keys;
+        if (until > after) {
+            SQLITE_CHECK(sqlite3_prepare_v2(db_, select_sql, -1, &stmt, nullptr));
+            sqlite3_bind_double(stmt, 1, after);
+            sqlite3_bind_double(stmt, 2, until);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char *text = (const char *)sqlite3_column_text(stmt, 0);
+                if (text)
+                    keys.emplace_back(text);
+            }
+            sqlite3_finalize(stmt);
+
+            SQLITE_CHECK(sqlite3_prepare_v2(db_, delete_sql, -1, &stmt, nullptr));
+            sqlite3_bind_double(stmt, 1, after);
+            sqlite3_bind_double(stmt, 2, until);
+            SQLITE_CHECK_DONE(sqlite3_step(stmt));
+            sqlite3_finalize(stmt);
+        }
+
+        SQLITE_CHECK(sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr));
+        return {std::move(keys), until};
     }
 
     void mark_persisted(const std::vector<std::string> &chunk_labels) {
@@ -373,6 +450,15 @@ Record::~Record() = default;
 
 void Record::submit(const std::string &label, const std::vector<std::string> &chunk_labels) {
     impl_->submit(label, chunk_labels);
+}
+
+void Record::touch(const std::string &label, const std::vector<std::string> &chunk_labels) {
+    impl_->touch(label, chunk_labels);
+}
+
+std::pair<std::vector<std::string>, double> Record::evict(double after, double before,
+                                                          size_t max_count) {
+    return impl_->evict(after, before, max_count);
 }
 
 void Record::mark_persisted(const std::vector<std::string> &chunk_labels) {

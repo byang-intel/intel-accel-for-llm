@@ -121,6 +121,11 @@ class Record {
 
     void submit(const std::string &label, const std::vector<std::string> &chunk_labels);
 
+    void touch(const std::string &label, const std::vector<std::string> &chunk_labels);
+
+    std::pair<std::vector<std::string>, double> evict(double after, double before,
+                                                      size_t max_count);
+
     void mark_persisted(const std::vector<std::string> &chunk_labels);
 
     void remove(const std::vector<std::string> &chunk_labels);
@@ -181,6 +186,8 @@ class Mem {
     std::vector<std::tuple<std::string, size_t>> persist_groups(size_t max_groups);
 
     std::vector<std::tuple<std::string, size_t>> evict_groups(size_t max_groups);
+
+    void evict_labels(const std::vector<std::string> &group_keys);
 
     size_t evict_to_size(size_t target_bytes);
     size_t force_evict_to_size(size_t target_bytes);

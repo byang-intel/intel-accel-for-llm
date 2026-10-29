@@ -177,7 +177,7 @@ Each IP must belong to an RDMA NIC on its own node. The selected interfaces for 
   ```
   A response such as `{"workers": [...]}` indicates that the control plane, including all four ranks, is ready.
 - **Check data-plane activity:** on the first matching put/get, daemon rank logs should include `[kv_xfer/rdma] pool: N blocks x M descs of L B` and `[kv_xfer] copy_chunks_batch: using RDMA backend`.
-- **Clear the cache:** `curl -s -X POST http://10.10.10.10:18700/v1/cache/evict -d '{"count": 500000000000}'`. The controller forwards the request to all four local workers.
+- **Pause or resume automatic eviction:** `curl -s -X POST http://10.10.10.10:18700/v1/cache/evict -d '{"enable": false}'` (or `true`). The daemon's scheduler evicts DDR cache groups automatically and is on by default; the controller handles this request itself. Pause it before `persist` to keep unpersisted groups.
 - **Read metrics:** `curl -s http://10.10.10.10:18700/v1/cache/metrics`.
 
 ---

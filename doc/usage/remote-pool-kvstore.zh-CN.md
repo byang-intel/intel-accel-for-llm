@@ -220,8 +220,9 @@ IP 必须是**所在节点本机** RDMA 网口的地址；两端同一 rank 所�
 - **看流量**：daemon 侧 rank 进程日志会打印 `[kv_xfer/rdma] pool: N blocks x M
   descs of L B` 和 `[kv_xfer] copy_chunks_batch: using RDMA backend`——第一次
   put/get 命中时出现。
-- **清缓存**：`curl -s -X POST http://10.10.10.10:18700/v1/cache/evict -d
-  '{"count": 500000000000}'`。controller 会自动 fan-out 到本机 4 个 worker。
+- **暂停 / 恢复自动淘汰**：`curl -s -X POST http://10.10.10.10:18700/v1/cache/evict -d
+  '{"enable": false}'`（恢复用 `true`）。daemon 的 scheduler 默认自动淘汰 DDR 中的 cache group，
+  该请求由 controller 自己处理。`persist` 前先暂停，可保留未持久化的 group。
 - **导出 metrics**：`curl -s http://10.10.10.10:18700/v1/cache/metrics`。
 
 ---
