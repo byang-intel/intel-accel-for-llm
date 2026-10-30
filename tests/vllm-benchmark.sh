@@ -1,16 +1,13 @@
 #!/bin/bash -e
 #
-# NOTE: When running multiple benchmark rounds, KV Cache offloaded to DDR
-# accumulates across runs and can cause CPU memory OOM. Evict cache between
-# runs:
+# NOTE: KVShrink evicts DDR cache automatically once usage reaches
+# IAXL_DDR_POOL_EVICT_HIGH_WATERMARK, so multiple benchmark rounds do not
+# accumulate cache until OOM. To keep the cache, pause eviction, persist
+# it to disk, then resume:
 #
-#   curl -X POST http://localhost:18700/v1/cache/evict \
-#     -d '{"count": 999999}'
-#
-# Or persist valuable caches to disk first, then evict:
-#
+#   curl -X POST http://localhost:18700/v1/cache/evict   -d '{"enable": false}'
 #   curl -X POST http://localhost:18700/v1/cache/persist -d '{"count": 999999}'
-#   curl -X POST http://localhost:18700/v1/cache/evict   -d '{"count": 999999}'
+#   curl -X POST http://localhost:18700/v1/cache/evict   -d '{"enable": true}'
 #
 
 export MODEL=${MODEL:-Qwen/Qwen3-32B}

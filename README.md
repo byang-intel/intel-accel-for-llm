@@ -134,27 +134,32 @@ Keep the KVShrink vLLM service running and execute the online serving benchmark 
 
 ## REST API
 
-The management API listens on `localhost:18700` by default and forwards requests to each rank.
+The management API listens on `localhost:18700` by default and forwards requests to each rank, except `evict`, which the controller handles itself.
 
 | Endpoint | Description |
 | --- | --- |
 | `GET /v1/cache/status` | Query cache status |
-| `POST /v1/cache/evict` | Evict cache groups from DDR |
+| `POST /v1/cache/evict` | Turn automatic DDR eviction on or off (on by default) |
 | `POST /v1/cache/persist` | Persist cache groups to disk |
 
 ```bash
 curl http://localhost:18700/v1/cache/status
 ```
 
-For `persist` and `evict`, `count` specifies the maximum number of cache groups to process. To preserve cached data, call `persist` before `evict`:
+The scheduler evicts least-recently-used cache groups from DDR automatically once usage reaches `IAXL_DDR_POOL_EVICT_HIGH_WATERMARK` (0.90 by default), down to about `IAXL_DDR_POOL_EVICT_LOW_WATERMARK` (0.5 by default). Groups that `has()` reported within the last `IAXL_DDR_POOL_EVICT_LEASE_S` seconds (300 by default) are skipped, unless that leaves usage above `IAXL_DDR_POOL_EVICT_FORCE_WATERMARK` (0.8 by default): then the oldest leased groups are evicted too. Keep FORCE well above LOW, because evicting a leased group may race a load or save that `has()` already promised. `evict` takes `{"enable": true|false}` and returns `{"auto_evict": ...}`; without `enable` it only reports the current state. Turning it off returns after any eviction in progress has finished.
+
+For `persist`, `count` specifies the maximum number of cache groups to process. Eviction drops unpersisted cache groups, so to keep the whole cache, pause eviction, persist, then resume:
 
 ```bash
+curl -X POST http://localhost:18700/v1/cache/evict \
+	-H 'Content-Type: application/json' \
+	-d '{"enable":false}'
 curl -X POST http://localhost:18700/v1/cache/persist \
 	-H 'Content-Type: application/json' \
 	-d '{"count":999999}'
 curl -X POST http://localhost:18700/v1/cache/evict \
 	-H 'Content-Type: application/json' \
-	-d '{"count":999999}'
+	-d '{"enable":true}'
 ```
 
 ## Cross-Node KV Cache Reuse

@@ -1,10 +1,15 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import logging
+import math
+import os
+import threading
+import time
 import torch
 import numpy as np
-from typing import Dict, List, Mapping, Optional, TYPE_CHECKING, Union
+from typing import Dict, List, Mapping, Optional, Set, TYPE_CHECKING, Union, cast
 import psutil
 from ..envs import envs
 from ..kvflow import KVFlow, Task, get_accelerator_device
@@ -16,7 +21,12 @@ from ..utils.profiler import (
     start_profiling,
     stop_profiling,
 )
-from .api import register as mgmt_register, start_mgmt_server, stop_mgmt_server
+from .api import (
+    ControllerServer,
+    register as mgmt_register,
+    start_mgmt_server,
+    stop_mgmt_server,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +34,21 @@ logger = logging.getLogger(__name__)
 def _get_default_cache_size_gb() -> float:
     available_bytes = psutil.virtual_memory().available
     return available_bytes / (10 * 1024**3)
+
+
+def _abort_on_error(fn):
+    # An exception would only end the evict thread, leaving ranks diverged and has() possibly stuck.
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except BaseException:
+            logger.critical(
+                "DDR pool evict failed, ranks may diverge; aborting", exc_info=True
+            )
+            os.abort()
+
+    return wrapper
 
 
 class KVStoreLocal:
@@ -125,8 +150,16 @@ class KVStoreLocal:
         )
 
         role = "controller" if self.has_only_mode else "worker"
+        self._evict_cond = threading.Condition()  # has() vs. the scheduler's evict decision
+        self._evicting: Set[str] = set()  # group keys the workers are still dropping
+        self._evict_enabled = True  # auto-evict switch, POST /v1/cache/evict
         if role == "worker":
             mgmt_register("GET", "/v1/cache/status", lambda params, s=self: s.status())
+            mgmt_register(
+                "GET",
+                "/v1/cache/simple_status",
+                lambda params, s=self: s.simple_status(),
+            )
             mgmt_register(
                 "GET",
                 "/v1/health",
@@ -140,20 +173,41 @@ class KVStoreLocal:
                     "result": s.persist(int(body.get("count", 10))),
                 },
             )
-            mgmt_register(
-                "POST",
-                "/v1/cache/evict",
-                lambda body, s=self: {
-                    "rank": s.rank,
-                    "result": s.evict(int(body.get("count", 10))),
-                },
-            )
+
+            def evict_labels(body, s=self):
+                s.tensorzip.mem.evict_labels(body["labels"])  # raises -> HTTP 500 -> scheduler aborts
+                return {"rank": s.rank}
+
+            mgmt_register("POST", "/v1/cache/evict_labels", evict_labels)
             mgmt_register(
                 "GET", "/v1/cache/metrics", lambda params, s=self: s.metrics(params)
             )
         self._mgmt_server = start_mgmt_server(
             role=role, rank=self.rank, num_workers=self.tp_size
         )
+        if role == "controller":
+            self._controller = cast(ControllerServer, self._mgmt_server)
+            # Workers start with an empty DDR pool: every row already in the DB is disk-only.
+            self._evicted_until = time.time()
+
+            def set_auto_evict(body, s=self):
+                enable = body.get("enable")
+                if enable is not None:
+                    if not isinstance(enable, bool):
+                        raise ValueError(
+                            f"enable must be true or false, got {enable!r}"
+                        )
+                    with s._evict_cond:
+                        s._evict_enabled = enable
+                        s._evict_cond.wait_for(lambda: not s._evicting)  # off: in-flight eviction done
+                    logger.info("DDR pool auto evict %s", "on" if enable else "off")
+                return {"auto_evict": s._evict_enabled}
+
+            self._controller.post_routes["/v1/cache/evict"] = set_auto_evict
+            self._monitor_stop = threading.Event()
+            threading.Thread(
+                target=self._monitor_loop, name="iaxl-monitor", daemon=True
+            ).start()
 
     def put(
         self,
@@ -286,10 +340,15 @@ class KVStoreLocal:
             self.tensorzip.record_flush()
             return []
 
-        results = self.tensorzip.has(
-            label=label or self.LABEL,
-            chunk_labels=block_hashs,
-        )
+        label = label or self.LABEL
+        with self._evict_cond:
+            if self._evicting:
+                keys = {f"{label}:{h}" for h in block_hashs}  # group keys, as Record.evict returns
+                self._evict_cond.wait_for(lambda: self._evicting.isdisjoint(keys))
+            results = self.tensorzip.has(label=label, chunk_labels=block_hashs)
+            if self.has_only_mode:
+                # Every hit, including those past the truncation point that the connector re-saves.
+                self.tensorzip.record.touch(label, block_hashs)
         if not truncate:
             return results
 
@@ -302,8 +361,113 @@ class KVStoreLocal:
         return results
 
     def stop(self):
+        if self.has_only_mode:
+            self._monitor_stop.set()
         stop_mgmt_server(self)
         self.tensorzip.stop()
+
+    _EVICT_BATCH = 16384
+
+    def evict_lru(self, max_count: int, min_count: int = 0) -> int:
+        # Evicts up to max_count lease-expired groups, and at least min_count groups even if
+        # their lease has not expired. Returns the number of groups evicted.
+        min_count = min(min_count, max_count)
+        evicted = 0
+        while evicted < max_count:
+            with self._evict_cond:
+                self._evict_cond.wait_for(lambda: not self._evicting)  # one eviction at a time
+                if not self._evict_enabled:  # switched off after _monitor_loop checked
+                    break
+                labels, self._evicted_until = self.tensorzip.record.evict(
+                    self._evicted_until,
+                    time.time() - envs.IAXL_DDR_POOL_EVICT_LEASE_S,
+                    min(self._EVICT_BATCH, max_count - evicted),
+                    max(0, min(self._EVICT_BATCH, min_count - evicted)),
+                )
+                if not labels:
+                    break
+                # has() on these waits until every rank has dropped them.
+                self._evicting.update(labels)
+            workers = self._controller.broadcast(
+                lambda c: c.post("/v1/cache/evict_labels", {"labels": labels})
+            )
+            failed = {r: w for r, w in workers.items() if "error" in w}
+            if failed:
+                raise RuntimeError(f"evict_labels failed: {failed}")
+            with self._evict_cond:
+                self._evicting.clear()
+                self._evict_cond.notify_all()
+            evicted += len(labels)
+        return evicted
+
+    _MONITOR_INTERVAL_S = 10
+
+    @_abort_on_error
+    def _monitor_loop(self) -> None:
+        # Rank 0's DDR pool stands for all ranks: logs its status and drives auto eviction.
+        last_evict_check = time.monotonic()
+        while not self._monitor_stop.wait(self._MONITOR_INTERVAL_S):
+            st = self._controller.broadcast(
+                lambda c: c.get("/v1/cache/simple_status"), ranks=[0]
+            )["0"]
+            if "error" in st:
+                raise RuntimeError(f"DDR pool status failed: {st}")
+            self._log_pool_status(st)
+
+            now = time.monotonic()
+            if now - last_evict_check < envs.IAXL_DDR_POOL_EVICT_INTERVAL_S:
+                continue
+            last_evict_check = now
+            if not self._evict_enabled or not st["capacity_bytes"]:  # 0 = unlimited pool
+                continue
+            cap = st["capacity_bytes"]
+            cur = st["current_bytes"]
+            usage = cur / cap
+            if usage >= envs.IAXL_DDR_POOL_EVICT_HIGH_WATERMARK and st["group_count"]:
+                # Groups are about the same size; Mem only warns when over budget, so cur may
+                # exceed cap and the byte deficit (not a ratio of group_count) is what to free.
+                group_bytes = cur / st["group_count"]
+
+                def groups_to(mark: float) -> int:
+                    return max(0, math.ceil((cur - mark * cap) / group_bytes))
+
+                max_count = groups_to(envs.IAXL_DDR_POOL_EVICT_LOW_WATERMARK)
+                min_count = groups_to(envs.IAXL_DDR_POOL_EVICT_FORCE_WATERMARK)
+                t0 = time.monotonic()
+                evicted = self.evict_lru(max_count, min_count)
+                logger.info(
+                    "[evict] triggered: DDR pool usage %.2f, evicted %d LRU groups "
+                    "(target %d, forced at least %d) in %.3fs",
+                    usage,
+                    evicted,
+                    max_count,
+                    min_count,
+                    time.monotonic() - t0,
+                )
+
+    def _log_pool_status(self, st: dict) -> None:
+        gib = 1024**3
+        zip_bytes = st["current_bytes"]
+        cap = st["capacity_bytes"]
+        # Mem only tracks cumulative zip/unzip totals; apply that ratio to what is resident now.
+        ratio = (
+            st["total_zip_bytes"] / st["total_unzip_bytes"]
+            if st["total_unzip_bytes"]
+            else 1.0
+        )
+        with self._evict_cond:
+            evicting = len(self._evicting)
+        logger.info(
+            "[monitor][rank%d] | mem pool %.2f/%.2fG (%.0f%%) %d grp | "
+            "zip/raw %.2f/%.2fG (%.2f) | "
+            "evict %s/%d | "
+            "host mem %.1f/%.1fG",
+            self.rank,
+            zip_bytes / gib, cap / gib, zip_bytes / cap * 100 if cap else 0.0, st["group_count"],
+            zip_bytes / gib, zip_bytes / ratio / gib if ratio else 0.0, ratio,
+            "on" if self._evict_enabled else "off", st["evictions"],
+            st["host_mem_used_bytes"] / gib, st["host_mem_total_bytes"] / gib,
+        )
 
     def status(self) -> dict:
         status = self.tensorzip.status()
@@ -311,6 +475,22 @@ class KVStoreLocal:
         status["num_layers"] = len(self.layer_names)
         status["kvcache_shape"] = self.kvcache_shape
         return status
+
+    def simple_status(self) -> dict:
+        # Just what _monitor_loop needs; skips the O(n) unpersisted_count walk of status().
+        mem = self.tensorzip.mem
+        vm = psutil.virtual_memory()
+        return {
+            "rank": self.rank,
+            "current_bytes": mem.current_bytes,
+            "capacity_bytes": mem.capacity_bytes,
+            "group_count": mem.group_count,
+            "total_zip_bytes": mem.total_zip_bytes,
+            "total_unzip_bytes": mem.total_unzip_bytes,
+            "evictions": mem.evictions,
+            "host_mem_used_bytes": vm.used,
+            "host_mem_total_bytes": vm.total,
+        }
 
     def metrics(self, params: Optional[dict] = None) -> dict:
         from ..torch_ext import (

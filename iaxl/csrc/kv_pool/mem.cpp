@@ -5,6 +5,7 @@
 #include "env.h"
 #include "kv_pool.h"
 #include "parallel.h"
+#include "task_queue.h"
 
 #include <algorithm>
 #include <atomic>
@@ -177,7 +178,10 @@ class Mem::Impl {
             free(p);
     }
 
-    ~Impl() { cache_.clear(); }
+    ~Impl() {
+        free_queue_.shutdown(); // drains pending frees
+        cache_.clear();
+    }
 
     void lock() { mutex_.lock(); }
     void unlock() { mutex_.unlock(); }
@@ -235,6 +239,38 @@ class Mem::Impl {
         wait_deletion_guard();
         std::lock_guard<std::mutex> lock(mutex_);
         return evict_groups_unlocked(max_groups);
+    }
+
+    // Unlinks the groups now; their buffers are freed on free_queue_'s thread.
+    void evict_labels(const std::vector<std::string> &group_keys) {
+        std::vector<std::unordered_map<std::string, SubEntry>> detached;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto &group_key : group_keys) {
+                auto it = cache_.find(group_key);
+                if (it == cache_.end())
+                    continue;
+                EntryGroup &group = it->second;
+                current_bytes_ -= group.total_bytes();
+                total_entries_ -= group.entry_count();
+                lru_remove(&group);
+                unpersisted_remove(&group);
+                detached.push_back(std::move(group.entries));
+                cache_.erase(it);
+                evictions_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!detached.empty()) {
+            free_queue_.init(); // idempotent: no thread until the first eviction
+            free_queue_.submit([this, d = std::move(detached)]() mutable {
+                // Safe without blocking new acquirers: a get() that acquired the guard after
+                // the unlink above cannot find these groups, so only a get() that took its
+                // pointers before the unlink can reference them, and that one holds the
+                // guard until it has finished using them.
+                wait_deletion_guard();
+                d.clear();
+            });
+        }
     }
 
     void put_unlocked(const std::vector<std::string> &keys, std::vector<char *> &&data_ptrs,
@@ -848,6 +884,8 @@ class Mem::Impl {
 
     std::atomic<uint64_t> total_unzip_bytes_{0};
     std::atomic<uint64_t> total_zip_bytes_{0};
+
+    TaskQueue free_queue_{"iaxl-mem-free"};
 };
 
 Mem::Mem(size_t capacity_bytes, Storage *storage, Record *record)
@@ -879,6 +917,10 @@ std::vector<std::tuple<std::string, size_t>> Mem::persist_groups(size_t max_grou
 
 std::vector<std::tuple<std::string, size_t>> Mem::evict_groups(size_t max_groups) {
     return impl_->evict_groups(max_groups);
+}
+
+void Mem::evict_labels(const std::vector<std::string> &group_keys) {
+    impl_->evict_labels(group_keys);
 }
 
 size_t Mem::evict_to_size(size_t target_bytes) { return impl_->evict_to_size(target_bytes); }

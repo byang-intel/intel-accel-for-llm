@@ -229,6 +229,14 @@ def _make_controller_handler(controller: "ControllerServer"):
             body: dict = {}
             if content_len > 0:
                 body = json.loads(self.rfile.read(content_len))
+            local = controller.post_routes.get(parsed.path.rstrip("/"))
+            if local is not None:
+                try:
+                    self._json_ok(local(body))
+                except Exception as e:
+                    logger.exception("Handler error: POST %s", parsed.path)
+                    self._json_err(str(e), 500)
+                return
             forward_path = _strip_controller_params(self.path)
             results = controller.broadcast(
                 lambda c, p=forward_path, b=body: c.post(p, b), ranks=ranks
@@ -280,6 +288,7 @@ class ControllerServer:
         )
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self.post_routes: Dict[str, Callable[[dict], Any]] = {}  # served here, not forwarded
 
     def start(self) -> None:
         handler_class = _make_controller_handler(self)
