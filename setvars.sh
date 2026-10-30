@@ -101,8 +101,12 @@ export IAXL_DDR_POOL_TOTAL_SIZE_GB # DDR (host) cache pool budget across all ran
 IAXL_DDR_POOL_SIZE_GB="${IAXL_DDR_POOL_SIZE_GB:-$((IAXL_DDR_POOL_TOTAL_SIZE_GB / NUM_WORKERS))}"
 export IAXL_DDR_POOL_SIZE_GB # Per-rank DDR pool size in GB (default TOTAL / NUM_WORKERS)
 export IAXL_DDR_POOL_EVICT_HIGH_WATERMARK=${IAXL_DDR_POOL_EVICT_HIGH_WATERMARK:-0.90} # Scheduler evicts LRU groups once the DDR pool reaches this usage ratio
-export IAXL_DDR_POOL_EVICT_LOW_WATERMARK=${IAXL_DDR_POOL_EVICT_LOW_WATERMARK:-0.5}    # ... until usage drops to about this ratio
-export IAXL_DDR_POOL_EVICT_LEASE_S=${IAXL_DDR_POOL_EVICT_LEASE_S:-300}               # Groups hit by has() within this many seconds are never evicted; must exceed has() -> last load/save of a request
+export IAXL_DDR_POOL_EVICT_LOW_WATERMARK=${IAXL_DDR_POOL_EVICT_LOW_WATERMARK:-0.5}    # ... until usage drops to about this ratio, evicting only groups whose lease (LEASE_S) has expired
+# WARNING: reaching FORCE may evict the oldest groups that are still within their lease, i.e. groups has()
+# reported as present whose get()/put() may not have landed yet (see doc/design/eviction.md). Keep FORCE
+# well above LOW so it only kicks in as a last resort under hot load; values below 0.5 are rejected.
+export IAXL_DDR_POOL_EVICT_FORCE_WATERMARK=${IAXL_DDR_POOL_EVICT_FORCE_WATERMARK:-0.8} # Usage one pass must reach even if it has to evict groups still within their lease (0.5 <= LOW <= FORCE <= HIGH)
+export IAXL_DDR_POOL_EVICT_LEASE_S=${IAXL_DDR_POOL_EVICT_LEASE_S:-300}               # Groups hit by has() within this many seconds are not evicted unless needed to reach FORCE; must exceed has() -> last load/save of a request
 export IAXL_DDR_POOL_EVICT_INTERVAL_S=${IAXL_DDR_POOL_EVICT_INTERVAL_S:-30}          # How often the scheduler checks DDR pool usage
 
 # ---- Intel QAT (compression accelerator) ------------------------------------

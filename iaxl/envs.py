@@ -76,12 +76,26 @@ class Envs:
         self.IAXL_DDR_POOL_SIZE_GB = _float_or_none("IAXL_DDR_POOL_SIZE_GB")
         self.IAXL_DDR_POOL_EVICT_HIGH_WATERMARK = _float("IAXL_DDR_POOL_EVICT_HIGH_WATERMARK", 0.90)
         self.IAXL_DDR_POOL_EVICT_LOW_WATERMARK = _float("IAXL_DDR_POOL_EVICT_LOW_WATERMARK", 0.5)
+        self.IAXL_DDR_POOL_EVICT_FORCE_WATERMARK = _float("IAXL_DDR_POOL_EVICT_FORCE_WATERMARK", 0.8)
         self.IAXL_DDR_POOL_EVICT_LEASE_S = _float("IAXL_DDR_POOL_EVICT_LEASE_S", 300)
         self.IAXL_DDR_POOL_EVICT_INTERVAL_S = _float("IAXL_DDR_POOL_EVICT_INTERVAL_S", 30)
         if not 0 <= self.IAXL_DDR_POOL_EVICT_LOW_WATERMARK < self.IAXL_DDR_POOL_EVICT_HIGH_WATERMARK <= 1:
             raise ValueError(
                 "IAXL_DDR_POOL_EVICT_LOW/HIGH_WATERMARK must satisfy 0 <= LOW < HIGH <= 1"
             )
+        if not (
+            self.IAXL_DDR_POOL_EVICT_LOW_WATERMARK
+            <= self.IAXL_DDR_POOL_EVICT_FORCE_WATERMARK
+            <= self.IAXL_DDR_POOL_EVICT_HIGH_WATERMARK
+        ):
+            raise ValueError(
+                "IAXL_DDR_POOL_EVICT_FORCE_WATERMARK must satisfy LOW <= FORCE <= HIGH"
+            )
+        # Reaching FORCE evicts groups still within their lease (has() hits not yet loaded/saved).
+        assert self.IAXL_DDR_POOL_EVICT_FORCE_WATERMARK >= 0.5, (
+            "IAXL_DDR_POOL_EVICT_FORCE_WATERMARK must be >= 0.5: it overrides the eviction lease "
+            "and should only kick in as a last resort under hot load"
+        )
         if self.IAXL_DDR_POOL_EVICT_LEASE_S <= 0 or self.IAXL_DDR_POOL_EVICT_INTERVAL_S <= 0:
             raise ValueError("IAXL_DDR_POOL_EVICT_LEASE_S/INTERVAL_S must be > 0")
         self.IAXL_SCRATCH_POOL_SIZE_GB = _int("IAXL_SCRATCH_POOL_SIZE_GB", 8)

@@ -45,7 +45,7 @@ Breaking either one makes `unzip_from_mem` miss at load time and the process abo
   - After unlocking, broadcast to all ranks and wait for them to unlink; then clear the set and wake waiters. Neither the broadcast nor the wait holds the lock.
   - A `has()` whose labels intersect the set waits until eviction finishes; a disjoint `has()` waits for one SQLite transaction only. Scheduling is never stalled by an eviction as a whole.
   - For the selected labels the effect equals "the whole eviction ran under the lock": by the time `has()` sees them, every rank has already dropped them. Persisted rows survive eviction in the database, so a `has()` hitting them must wait as well, otherwise `get()` could race a late unlink.
-- **touch + lease covers the asynchronous window.** The scheduler cannot see the gap between `has()` returning and the `get`/`put` landing. `has()` touches every hit under the lock; eviction only selects rows with `last_access < now − LEASE` (default 300 s). A group reported by `has()` is never evicted by any rank within the lease.
+- **touch + lease covers the asynchronous window.** The scheduler cannot see the gap between `has()` returning and the `get`/`put` landing. `has()` touches every hit under the lock; eviction only selects rows with `last_access < now − LEASE` (default 300 s). A group reported by `has()` is not evicted by any rank within the lease, with one deliberate exception: when the lease-expired groups alone cannot bring usage down to `FORCE_WATERMARK`, the oldest leased groups are evicted as well (see *Lease vs. a pool that fills faster than leases expire* below).
 
 ### Why puts never need to be paused
 
@@ -67,10 +67,12 @@ A put to a selected label can therefore only happen after all ranks have unlinke
 ### Practical details
 
 - **The database cannot tell which groups are in DDR.** `persisted` only says whether the disk copy exists; evicted persisted rows stay the oldest forever and would be selected again and again. Since LRU always cuts the oldest slice off the timeline, the scheduler keeps a cut `evicted_until`: rows with `last_access > evicted_until` are the DDR-resident groups. Rows sharing one timestamp are selected together or kept together.
-- **The scheduler does not know the usage.** It reads rank 0's `GET /v1/cache/status` through the controller, reusing `Mem`'s existing counters.
-- **There was no automatic eviction.** A scheduler background thread polls rank 0 every `_MONITOR_INTERVAL_S` (10 s) to log the pool status, and every `IAXL_DDR_POOL_EVICT_INTERVAL_S` (default 30 s) checks the usage. At `usage ≥ HIGH` it evicts `ceil(group_count × (1 − LOW / usage))` groups to land near LOW in one pass.
+- **The scheduler does not know the usage.** It reads rank 0's `GET /v1/cache/simple_status` through the controller, reusing `Mem`'s existing counters.
+- **There was no automatic eviction.** A scheduler background thread polls rank 0 every `_MONITOR_INTERVAL_S` (10 s) to log the pool status, and every `IAXL_DDR_POOL_EVICT_INTERVAL_S` (default 30 s) checks the usage. At `usage ≥ HIGH` one pass frees the byte deficit in groups of average size: `max_count = ceil((current − LOW × capacity) / (current / group_count))` lease-expired groups to land near LOW, and `min_count = ceil((current − FORCE × capacity) / (current / group_count))` groups that are evicted even if their lease has not run out. `Mem` only warns when over budget, so `current` may exceed `capacity`; the byte form handles that directly.
+- **Lease vs. a pool that fills faster than leases expire.** Hot workloads can leave fewer lease-expired groups than needed. `Record.evict(after, before, max_count, min_count)` takes up to `max_count` rows older than `before`; if that yields fewer than `min_count`, it moves the cut to the `min_count`-th oldest row regardless of `before`. **Warning:** evicting inside the lease reopens the asynchronous window for those (oldest) groups: a `get`/`put` that `has()` already promised may find them gone on some rank. FORCE is therefore a last resort for hot load, not the normal target: keep it well above LOW, and `envs.py` rejects values below 0.5.
+- **Batching.** A multi-TB pool holds millions of groups, so one pass is split into `_EVICT_BATCH` (4096) groups per `evict_labels` request: each request stays small, and a `has()` on the selected labels waits for one batch, not the whole pass. `_evicted_until` advances per batch.
 - **Lock hold time.** One SQLite transaction under the lock. Broadcast and unlinking run outside it; `Mem::evict_labels` only removes groups from its index and defers `free()` to a background thread. Only `has()` calls that query the evicted labels wait, estimated at tens of milliseconds.
-- **Groups being decompressed.** Selected groups are past their lease, and a `has()` hitting them during eviction is blocked, so no `get` is in flight for them. `evict_labels` does not call `wait_deletion_guard()`: loads of other groups continue during eviction and the global counter may never reach zero.
+- **Groups being decompressed.** Selected groups are past their lease (or, under FORCE, the oldest leased ones), and a `has()` hitting them during eviction is blocked, so no `get` is in flight for them. `evict_labels` does not call `wait_deletion_guard()`: loads of other groups continue during eviction and the global counter may never reach zero.
 - **Two writers on the rank 0 database.** The scheduler (`touch`/`evict`) and worker 0 (`put_finish`, `mark_persisted`). Both `touch` and `evict` use `BEGIN IMMEDIATE` to avoid `SQLITE_BUSY_SNAPSHOT`.
 - **Comparable timestamps.** `now_seconds()` moved from `steady_clock` to `system_clock`, the same clock as Python's `time.time()`, valid across restarts.
 - **TP=1 shares the process.** All new bindings release the GIL; the broadcast holds no Python lock and a waiting `has()` releases the condition lock, so there is no cycle.
@@ -93,16 +95,18 @@ sequenceDiagram
     S->>DB: has query, async touch of every hit
     Note over S: unlock
     loop every INTERVAL (default 30 s)
-        T->>W: GET /v1/cache/status (rank 0 only)
+        T->>W: GET /v1/cache/simple_status (rank 0 only)
         opt current_bytes / capacity_bytes >= HIGH
-            Note over T: lock
-            T->>DB: evict(after, now − LEASE, max_count): select oldest groups, delete their unpersisted rows
-            Note over T: _evicting = labels, unlock
-            T->>W: POST /v1/cache/evict_labels {labels}
-            W->>W: Mem::evict_labels unlinks (index only)
-            W-->>T: reply
-            Note over T: lock, clear _evicting, wake waiting has(), unlock
-            W->>W: background thread frees memory
+            loop batches of _EVICT_BATCH groups
+                Note over T: lock
+                T->>DB: evict(after, now − LEASE, max_count, min_count): select oldest groups, delete their unpersisted rows
+                Note over T: _evicting = labels, unlock
+                T->>W: POST /v1/cache/evict_labels {labels}
+                W->>W: Mem::evict_labels unlinks (index only)
+                W-->>T: reply
+                Note over T: lock, clear _evicting, wake waiting has(), unlock
+                W->>W: background thread frees memory
+            end
         end
     end
 ```
@@ -114,11 +118,12 @@ sequenceDiagram
 | `IAXL_DDR_POOL_TOTAL_SIZE_GB` | 80% of host RAM | DDR pool budget across all ranks, in whole GB. `setvars.sh` lowers it so that no rank exceeds 80% of one NUMA node (`host RAM / node count`), i.e. `min(0.8 × RAM, NUM_WORKERS × 0.8 × RAM / nodes)` |
 | `IAXL_DDR_POOL_SIZE_GB` | `TOTAL / NUM_WORKERS` | Per-rank pool capacity; `capacity_bytes` in the formulas below. Without `setvars.sh` the Python fallback is 1/10 of available RAM |
 | `IAXL_DDR_POOL_EVICT_HIGH_WATERMARK` | 0.90 | Eviction starts when `current_bytes / capacity_bytes` reaches this ratio |
-| `IAXL_DDR_POOL_EVICT_LOW_WATERMARK` | 0.5 | Target usage after one eviction pass |
-| `IAXL_DDR_POOL_EVICT_LEASE_S` | 300 | Groups hit by `has()` within this many seconds are never evicted; must exceed `has()` → last load/save of a request |
+| `IAXL_DDR_POOL_EVICT_LOW_WATERMARK` | 0.5 | Target usage after one eviction pass, evicting lease-expired groups only |
+| `IAXL_DDR_POOL_EVICT_FORCE_WATERMARK` | 0.8 | Usage one pass must reach even if it has to evict groups still within their lease; `0.5 <= FORCE`, `LOW <= FORCE <= HIGH`. Keep well above LOW: it bypasses the lease guarantee |
+| `IAXL_DDR_POOL_EVICT_LEASE_S` | 300 | Groups hit by `has()` within this many seconds are not evicted unless needed to reach FORCE; must exceed `has()` → last load/save of a request |
 | `IAXL_DDR_POOL_EVICT_INTERVAL_S` | 30 | How often the scheduler checks the pool usage |
 
-Defaults are those set by `setvars.sh`; the sizing helpers live in `tools/auto_config.sh` (`ddr_pool_total_size_gb`). `capacity_bytes == 0` means an unlimited pool and disables the check. The four `EVICT_*` variables take effect on the node that runs the scheduler (the daemon node under remote pool), like `IAXL_DDR_POOL_SIZE_GB`.
+Defaults are those set by `setvars.sh`; the sizing helpers live in `tools/auto_config.sh` (`ddr_pool_total_size_gb`). `capacity_bytes == 0` means an unlimited pool and disables the check. The five `EVICT_*` variables take effect on the node that runs the scheduler (the daemon node under remote pool), like `IAXL_DDR_POOL_SIZE_GB`.
 
 ### Deployment forms
 

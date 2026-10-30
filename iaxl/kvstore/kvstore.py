@@ -366,32 +366,42 @@ class KVStoreLocal:
         stop_mgmt_server(self)
         self.tensorzip.stop()
 
-    def evict_lru(self, max_count: int) -> int:
-        # Returns the number of groups evicted; may exceed max_count since Record.evict
-        # takes every row sharing the cut timestamp (one put/touch batch).
-        with self._evict_cond:
-            self._evict_cond.wait_for(lambda: not self._evicting)  # one eviction at a time
-            if not self._evict_enabled:  # switched off after _monitor_loop checked
-                return 0
-            labels, self._evicted_until = self.tensorzip.record.evict(
-                self._evicted_until,
-                time.time() - envs.IAXL_DDR_POOL_EVICT_LEASE_S,
-                max_count,
+    # Group keys per evict_labels request: bounds the JSON payload and the window during
+    # which has() on those keys waits, however large the pool.
+    _EVICT_BATCH = 4096
+
+    def evict_lru(self, max_count: int, min_count: int = 0) -> int:
+        # Evicts up to max_count lease-expired groups, and at least min_count groups even if
+        # their lease has not expired. Returns the number of groups evicted; a batch may exceed
+        # _EVICT_BATCH since Record.evict takes every row sharing the cut timestamp.
+        min_count = min(min_count, max_count)
+        evicted = 0
+        while evicted < max_count:
+            with self._evict_cond:
+                self._evict_cond.wait_for(lambda: not self._evicting)  # one eviction at a time
+                if not self._evict_enabled:  # switched off after _monitor_loop checked
+                    break
+                labels, self._evicted_until = self.tensorzip.record.evict(
+                    self._evicted_until,
+                    time.time() - envs.IAXL_DDR_POOL_EVICT_LEASE_S,
+                    min(self._EVICT_BATCH, max_count - evicted),
+                    max(0, min(self._EVICT_BATCH, min_count - evicted)),
+                )
+                if not labels:
+                    break
+                # has() on these waits until every rank has dropped them.
+                self._evicting.update(labels)
+            workers = self._controller.broadcast(
+                lambda c: c.post("/v1/cache/evict_labels", {"labels": labels})
             )
-            if not labels:
-                return 0
-            # has() on these waits until every rank has dropped them.
-            self._evicting.update(labels)
-        workers = self._controller.broadcast(
-            lambda c: c.post("/v1/cache/evict_labels", {"labels": labels})
-        )
-        failed = {r: w for r, w in workers.items() if "error" in w}
-        if failed:
-            raise RuntimeError(f"evict_labels failed: {failed}")
-        with self._evict_cond:
-            self._evicting.clear()
-            self._evict_cond.notify_all()
-        return len(labels)
+            failed = {r: w for r, w in workers.items() if "error" in w}
+            if failed:
+                raise RuntimeError(f"evict_labels failed: {failed}")
+            with self._evict_cond:
+                self._evicting.clear()
+                self._evict_cond.notify_all()
+            evicted += len(labels)
+        return evicted
 
     _MONITOR_INTERVAL_S = 10
 
@@ -413,18 +423,28 @@ class KVStoreLocal:
             last_evict_check = now
             if not self._evict_enabled or not st["capacity_bytes"]:  # 0 = unlimited pool
                 continue
-            usage = st["current_bytes"] / st["capacity_bytes"]
-            if usage >= envs.IAXL_DDR_POOL_EVICT_HIGH_WATERMARK:
-                # Groups are about the same size, so evicting this share lands near the low watermark.
-                share = 1 - envs.IAXL_DDR_POOL_EVICT_LOW_WATERMARK / usage
-                max_count = math.ceil(st["group_count"] * share)
+            cap = st["capacity_bytes"]
+            cur = st["current_bytes"]
+            usage = cur / cap
+            if usage >= envs.IAXL_DDR_POOL_EVICT_HIGH_WATERMARK and st["group_count"]:
+                # Groups are about the same size; Mem only warns when over budget, so cur may
+                # exceed cap and the byte deficit (not a ratio of group_count) is what to free.
+                group_bytes = cur / st["group_count"]
+
+                def groups_to(mark: float) -> int:
+                    return max(0, math.ceil((cur - mark * cap) / group_bytes))
+
+                max_count = groups_to(envs.IAXL_DDR_POOL_EVICT_LOW_WATERMARK)
+                min_count = groups_to(envs.IAXL_DDR_POOL_EVICT_FORCE_WATERMARK)
                 t0 = time.monotonic()
-                evicted = self.evict_lru(max_count)
+                evicted = self.evict_lru(max_count, min_count)
                 logger.info(
-                    "[evict] triggered: DDR pool usage %.2f, evicted %d LRU groups (target %d) in %.3fs",
+                    "[evict] triggered: DDR pool usage %.2f, evicted %d LRU groups "
+                    "(target %d, forced at least %d) in %.3fs",
                     usage,
                     evicted,
                     max_count,
+                    min_count,
                     time.monotonic() - t0,
                 )
 

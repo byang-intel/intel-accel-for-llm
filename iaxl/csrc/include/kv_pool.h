@@ -124,7 +124,7 @@ class Record {
     void touch(const std::string &label, const std::vector<std::string> &chunk_labels);
 
     std::pair<std::vector<std::string>, double> evict(double after, double before,
-                                                      size_t max_count);
+                                                      size_t max_count, size_t min_count = 0);
 
     void mark_persisted(const std::vector<std::string> &chunk_labels);
 

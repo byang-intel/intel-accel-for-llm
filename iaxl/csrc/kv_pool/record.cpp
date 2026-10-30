@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <list>
 #include <mutex>
 #include <string>
@@ -155,7 +156,10 @@ class Record::Impl {
     }
 
     // Rows with last_access > after are DDR-resident; returns the evicted group keys and the new cut.
-    std::pair<std::vector<std::string>, double> evict(double after, double before, size_t max_count) {
+    // Up to max_count rows older than `before` (the lease); if fewer than min_count qualify, the
+    // oldest rows are taken regardless of `before` until min_count is reached.
+    std::pair<std::vector<std::string>, double> evict(double after, double before, size_t max_count,
+                                                      size_t min_count) {
         std::lock_guard<std::mutex> lock(operation_mutex_);
         sync_locked();
         assert(db_ && "[Record] db_ must not be null");
@@ -172,18 +176,30 @@ class Record::Impl {
 
         SQLITE_CHECK(sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr));
 
-        sqlite3_stmt *stmt = nullptr;
-        SQLITE_CHECK(sqlite3_prepare_v2(db_, until_sql, -1, &stmt, nullptr));
-        sqlite3_bind_double(stmt, 1, after);
-        sqlite3_bind_double(stmt, 2, before);
-        sqlite3_bind_int64(stmt, 3, (sqlite3_int64)max_count);
-        double until = after;
-        if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
-            until = sqlite3_column_double(stmt, 0);
+        auto cut = [&](double upper, size_t limit) {
+            sqlite3_stmt *stmt = nullptr;
+            SQLITE_CHECK(sqlite3_prepare_v2(db_, until_sql, -1, &stmt, nullptr));
+            sqlite3_bind_double(stmt, 1, after);
+            sqlite3_bind_double(stmt, 2, upper);
+            sqlite3_bind_int64(stmt, 3, (sqlite3_int64)limit);
+            double until = after;
+            if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+                until = sqlite3_column_double(stmt, 0);
+            }
+            sqlite3_finalize(stmt);
+            return until;
+        };
+
+        double until = cut(before, max_count);
+        if (min_count > 0) {
+            // Sorted by last_access, the leased rows are a prefix: when fewer than min_count rows
+            // are past the lease, the min_count-th oldest row (lease ignored) lies beyond `until`.
+            until = std::max(until, cut(std::numeric_limits<double>::max(),
+                                        std::min(min_count, max_count)));
         }
-        sqlite3_finalize(stmt);
 
         std::vector<std::string> keys;
+        sqlite3_stmt *stmt = nullptr;
         if (until > after) {
             SQLITE_CHECK(sqlite3_prepare_v2(db_, select_sql, -1, &stmt, nullptr));
             sqlite3_bind_double(stmt, 1, after);
@@ -457,8 +473,8 @@ void Record::touch(const std::string &label, const std::vector<std::string> &chu
 }
 
 std::pair<std::vector<std::string>, double> Record::evict(double after, double before,
-                                                          size_t max_count) {
-    return impl_->evict(after, before, max_count);
+                                                          size_t max_count, size_t min_count) {
+    return impl_->evict(after, before, max_count, min_count);
 }
 
 void Record::mark_persisted(const std::vector<std::string> &chunk_labels) {

@@ -144,7 +144,7 @@ docker exec -it -w "$PWD" iaxl.vllm bash
 curl http://localhost:18700/v1/cache/status
 ```
 
-DDR 用量达到 `IAXL_DDR_POOL_EVICT_HIGH_WATERMARK`（默认 0.95）时，scheduler 自动淘汰最久未使用的 cache group，降到约 `IAXL_DDR_POOL_EVICT_LOW_WATERMARK`（默认 0.3）。`evict` 接受 `{"enable": true|false}`，返回 `{"auto_evict": ...}`；不带 `enable` 只查询当前状态。关闭请求在进行中的淘汰结束后才返回。
+DDR 用量达到 `IAXL_DDR_POOL_EVICT_HIGH_WATERMARK`（默认 0.90）时，scheduler 自动淘汰最久未使用的 cache group，降到约 `IAXL_DDR_POOL_EVICT_LOW_WATERMARK`（默认 0.5）。最近 `IAXL_DDR_POOL_EVICT_LEASE_S` 秒（默认 300）内被 `has()` 命中过的 group 不会被淘汰，除非这样用量仍高于 `IAXL_DDR_POOL_EVICT_FORCE_WATERMARK`（默认 0.8）：此时租期内最旧的 group 也会被淘汰。FORCE 应明显高于 LOW，因为淘汰租期内的 group 可能与 `has()` 已承诺的 load/save 产生竞争。`evict` 接受 `{"enable": true|false}`，返回 `{"auto_evict": ...}`；不带 `enable` 只查询当前状态。关闭请求在进行中的淘汰结束后才返回。
 
 `persist` 通过 `count` 指定最多处理的 cache group 数量。淘汰会丢弃未持久化的 cache group，需要完整保留 cache 时，先暂停淘汰，再 `persist`，最后恢复：
 

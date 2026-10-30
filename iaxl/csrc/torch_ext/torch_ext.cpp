@@ -450,12 +450,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("chunk_labels"))
         .def(
             "evict",
-            [](kv_pool::Record &self, double after, double before, size_t max_count) {
+            [](kv_pool::Record &self, double after, double before, size_t max_count,
+               size_t min_count) {
                 py::gil_scoped_release release;
-                return self.evict(after, before, max_count);
+                return self.evict(after, before, max_count, min_count);
             },
-            "Select the oldest DDR-resident groups and drop their unpersisted rows",
-            py::arg("after"), py::arg("before"), py::arg("max_count"))
+            "Select the oldest DDR-resident groups and drop their unpersisted rows; "
+            "ignores `before` for the oldest rows until min_count is reached",
+            py::arg("after"), py::arg("before"), py::arg("max_count"), py::arg("min_count") = 0)
         .def(
             "remove",
             [](kv_pool::Record &self, const std::vector<std::string> &chunk_labels) {
