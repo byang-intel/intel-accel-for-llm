@@ -4,6 +4,7 @@
 #include "iaxl_common.h"
 #include "env.h"
 #include "kv_pool.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -161,6 +163,18 @@ class Mem::Impl {
 
         unpersisted_head_.unpersisted_next = &unpersisted_head_;
         unpersisted_head_.unpersisted_prev = &unpersisted_head_;
+        constexpr size_t chunk = 2 << 20;
+        const size_t page = sysconf(_SC_PAGESIZE);
+        std::vector<void *> blocks(capacity_bytes / chunk + (capacity_bytes % chunk != 0));
+        parallel::parallel_for(blocks.size(), [&](size_t i) {
+            const size_t size = std::min(chunk, capacity_bytes - i * chunk);
+            blocks[i] = malloc(size);
+            IAXL_CHECK(blocks[i], "KV heap prefault allocation failed");
+            for (size_t offset = 0; offset < size; offset += page)
+                static_cast<volatile char *>(blocks[i])[offset] = 1;
+        });
+        for (void *p : blocks)
+            free(p);
     }
 
     ~Impl() { cache_.clear(); }
