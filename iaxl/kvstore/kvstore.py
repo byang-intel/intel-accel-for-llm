@@ -372,8 +372,7 @@ class KVStoreLocal:
 
     def evict_lru(self, max_count: int, min_count: int = 0) -> int:
         # Evicts up to max_count lease-expired groups, and at least min_count groups even if
-        # their lease has not expired. Returns the number of groups evicted; a batch may exceed
-        # _EVICT_BATCH since Record.evict takes every row sharing the cut timestamp.
+        # their lease has not expired. Returns the number of groups evicted.
         min_count = min(min_count, max_count)
         evicted = 0
         while evicted < max_count:

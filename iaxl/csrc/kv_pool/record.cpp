@@ -51,6 +51,10 @@ double now_seconds() {
     return std::chrono::duration<double>(now.time_since_epoch()).count();
 }
 
+// Rows of one batch get strictly increasing timestamps (1 us apart, ~4 double ulps at epoch
+// scale) so that Record::evict's timestamp cut can stop inside a batch instead of taking all of it.
+constexpr double kRowStep = 1e-6;
+
 } // namespace
 
 class Record::Impl {
@@ -120,7 +124,7 @@ class Record::Impl {
                 for (size_t j = i; j < end; j++) {
                     sqlite3_reset(stmt_);
                     sqlite3_bind_text(stmt_, 1, group_keys[j].c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_double(stmt_, 2, current_time);
+                    sqlite3_bind_double(stmt_, 2, current_time + j * kRowStep);
 
                     SQLITE_CHECK_DONE(sqlite3_step(stmt_));
                 }
@@ -143,10 +147,10 @@ class Record::Impl {
             SQLITE_CHECK(sqlite3_prepare_v2(
                 db_, "UPDATE chunks SET last_access = ? WHERE chunk_label = ?", -1, &stmt, nullptr));
             SQLITE_CHECK(sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr));
-            for (const auto &gk : group_keys) {
+            for (size_t j = 0; j < group_keys.size(); j++) {
                 sqlite3_reset(stmt);
-                sqlite3_bind_double(stmt, 1, now);
-                sqlite3_bind_text(stmt, 2, gk.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_double(stmt, 1, now + j * kRowStep);
+                sqlite3_bind_text(stmt, 2, group_keys[j].c_str(), -1, SQLITE_TRANSIENT);
                 SQLITE_CHECK_DONE(sqlite3_step(stmt));
             }
             SQLITE_CHECK(sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr));
@@ -164,7 +168,8 @@ class Record::Impl {
         sync_locked();
         assert(db_ && "[Record] db_ must not be null");
 
-        // Rows sharing the cut timestamp are selected together (see kvstore.py evicted_until).
+        // Rows sharing the cut timestamp are selected together (see kvstore.py evicted_until);
+        // submit/touch keep timestamps distinct within a batch so this is the rare case.
         const char *until_sql = "SELECT MAX(last_access) FROM "
                                 "(SELECT last_access FROM chunks "
                                 " WHERE last_access > ? AND last_access < ? "
