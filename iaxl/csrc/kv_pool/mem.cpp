@@ -5,6 +5,7 @@
 #include "env.h"
 #include "kv_pool.h"
 #include "parallel.h"
+#include "task_queue.h"
 
 #include <algorithm>
 #include <atomic>
@@ -24,7 +25,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -178,7 +178,10 @@ class Mem::Impl {
             free(p);
     }
 
-    ~Impl() { cache_.clear(); }
+    ~Impl() {
+        free_queue_.shutdown(); // drains pending frees
+        cache_.clear();
+    }
 
     void lock() { mutex_.lock(); }
     void unlock() { mutex_.unlock(); }
@@ -238,7 +241,7 @@ class Mem::Impl {
         return evict_groups_unlocked(max_groups);
     }
 
-    // Unlinks the groups now; their buffers are freed on a background thread.
+    // Unlinks the groups now; their buffers are freed on free_queue_'s thread.
     void evict_labels(const std::vector<std::string> &group_keys) {
         std::vector<std::unordered_map<std::string, SubEntry>> detached;
         {
@@ -257,8 +260,17 @@ class Mem::Impl {
                 evictions_.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        if (!detached.empty())
-            std::thread([d = std::move(detached)]() mutable { d.clear(); }).detach();
+        if (!detached.empty()) {
+            free_queue_.init(); // idempotent: no thread until the first eviction
+            free_queue_.submit([this, d = std::move(detached)]() mutable {
+                // Safe without blocking new acquirers: a get() that acquired the guard after
+                // the unlink above cannot find these groups, so only a get() that took its
+                // pointers before the unlink can reference them, and that one holds the
+                // guard until it has finished using them.
+                wait_deletion_guard();
+                d.clear();
+            });
+        }
     }
 
     void put_unlocked(const std::vector<std::string> &keys, std::vector<char *> &&data_ptrs,
@@ -872,6 +884,8 @@ class Mem::Impl {
 
     std::atomic<uint64_t> total_unzip_bytes_{0};
     std::atomic<uint64_t> total_zip_bytes_{0};
+
+    TaskQueue free_queue_{"iaxl-mem-free"};
 };
 
 Mem::Mem(size_t capacity_bytes, Storage *storage, Record *record)

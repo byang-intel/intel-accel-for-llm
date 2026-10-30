@@ -366,9 +366,7 @@ class KVStoreLocal:
         stop_mgmt_server(self)
         self.tensorzip.stop()
 
-    # Group keys per evict_labels request: bounds the JSON payload and the window during
-    # which has() on those keys waits, however large the pool.
-    _EVICT_BATCH = 4096
+    _EVICT_BATCH = 16384
 
     def evict_lru(self, max_count: int, min_count: int = 0) -> int:
         # Evicts up to max_count lease-expired groups, and at least min_count groups even if
