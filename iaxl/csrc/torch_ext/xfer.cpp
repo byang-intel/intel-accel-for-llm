@@ -13,7 +13,7 @@ void Context::xfer_chunk(const torch::Tensor &cpu_tensor, int64_t chunk_idx) {
     auto x = xctx_;
     auto ops = ops_;
 
-    queue_->submit([=]() {
+    queue_->submit([=, this]() {
         PROFILE_SCOPE_FMT("xfer_chunk(%s,stream=%llu,idx=%ld)", name_.c_str(), stream_id_,
                           chunk_idx);
         ops->copy_chunk(x, cpu_base, chunk_idx, h2d);
@@ -36,7 +36,7 @@ void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
         cpu_ptrs.push_back((char *)tensor.data_ptr());
     }
 
-    queue_->submit([=, chunk_indices = std::move(chunk_indices_copy)]() {
+    queue_->submit([=, this, chunk_indices = std::move(chunk_indices_copy)]() {
         PROFILE_SCOPE_FMT("xfer_chunks_batch(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
                           stream_id_, chunk_indices.size(), chunk_indices[0]);
         ops->copy_chunks_batch(x, chunk_indices, cpu_ptrs, h2d);
@@ -67,7 +67,7 @@ void Context::xfer_chunks_batch_fast(const torch::Tensor &chunk_indices,
     auto x = xctx_;
     auto ops = ops_;
 
-    queue_->submit([=, indices = std::move(indices), ptrs = std::move(ptrs)]() {
+    queue_->submit([=, this, indices = std::move(indices), ptrs = std::move(ptrs)]() {
         PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
                           stream_id_, indices.size(), indices[0]);
         ops->copy_chunks_batch(x, indices, ptrs, h2d);
@@ -81,7 +81,7 @@ void Context::xfer_finish() {
     auto ops = ops_;
     auto *ev_flag = &event_recorded_;
 
-    xfer_last_future_ = queue_->submit([=]() {
+    xfer_last_future_ = queue_->submit([=, this]() {
         PROFILE_SCOPE_FMT("xfer_finish(%s,stream=%llu)", name_.c_str(), stream_id_);
         ops->context_record_event(x, event);
         ev_flag->store(true, std::memory_order_release);

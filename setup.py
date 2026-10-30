@@ -48,8 +48,8 @@ class CMakeExtension(Extension):
                     pybind11.get_include(),
                 ],
                 extra_compile_args={
-                    "cxx": ["-O3", "-std=c++17"],
-                    "sycl": ["-O3", "-std=c++17"],
+                    "cxx": ["-O3", "-std=c++20"],
+                    "sycl": ["-O3", "-std=c++20"],
                 },
                 extra_link_args=["-lsycl"],
             )
