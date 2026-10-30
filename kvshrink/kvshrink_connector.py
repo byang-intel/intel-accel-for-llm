@@ -196,7 +196,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._current_put_tasks: dict[ReqId, list[dict[str, Any]]] = {}
         self._deferred_finished_req_ids: set[ReqId] = set()
         self._last_layer_name: Optional[str] = None
-        # Ordered worker-side layer names (populated in register_kv_caches),
+        # vLLM layer name -> KVStore key (the layer index as a string): short keys
+        # cut the per-block hashing/RPC cost of the long module names.
+        self._layer_key: dict[str, str] = {}
+        # Ordered worker-side KVStore keys (populated in register_kv_caches),
         # used to select the first N layers for async early-start.
         self._layer_names: list[str] = []
         # Async load bookkeeping (worker side).
@@ -532,22 +535,31 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             for ln in sorted(kv_caches, key=lambda ln: ln not in mamba_layers)
             if extract_layer_index(ln) < self.num_layers
         }
+        self._layer_key = {ln: str(extract_layer_index(ln)) for ln in kv_caches}
+        if len(set(self._layer_key.values())) != len(self._layer_key):
+            raise ValueError(
+                f"KV cache layers do not have unique layer indices: {self._layer_key}"
+            )
+        # layer_group is looked up by vLLM name; groups hold KVStore keys.
+        self.layer_group = {
+            ln: index
+            for index, (_, names) in enumerate(self.groups)
+            for ln in names
+            if ln in kv_caches
+        }
         self.groups = [
-            (is_mamba, [ln for ln in names if ln in kv_caches])
+            (is_mamba, [self._layer_key[ln] for ln in names if ln in kv_caches])
             for is_mamba, names in self.groups
         ]
-        self.layer_group = {
-            ln: index for index, (_, names) in enumerate(self.groups) for ln in names
-        }
 
         kv_caches = self._view_as_blocks(kv_caches)
         first_kv_cache = next(iter(kv_caches.values()))
         self._last_layer_name = next(reversed(kv_caches))
-        self._layer_names = list(kv_caches.keys())
+        self._layer_names = [self._layer_key[ln] for ln in kv_caches]
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
             block_dim=0,
-            kv_caches=kv_caches,
+            kv_caches={self._layer_key[ln]: t for ln, t in kv_caches.items()},
             rank=self.global_rank,
             tp_size=self.tp_size,
         )
@@ -657,11 +669,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not self._current_get_tasks and not self._active_promoted_tasks:
             return
 
+        layer_keys = [self._layer_key[layer_name]]
         # Wait for the synchronous (batched) loads for this layer.
         if self._current_get_tasks:
             success = self._store().get_wait(
                 get_results=self._current_get_tasks,
-                layer_names=[layer_name],
+                layer_names=layer_keys,
             )
             if not success:
                 raise RuntimeError(
@@ -674,7 +687,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for tasks in self._active_promoted_tasks.values():
             success = self._store().get_wait(
                 get_results=tasks,
-                layer_names=[layer_name],
+                layer_names=layer_keys,
             )
             if not success:
                 raise RuntimeError(
@@ -700,14 +713,16 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
+        group_idx = self.layer_group[layer_name]
+        layer_keys = [self._layer_key[layer_name]]
         for req_id, request in metadata.reqs_to_save.requests.items():
-            block_ids, block_hashes = request.for_group(self.layer_group[layer_name])
+            block_ids, block_hashes = request.for_group(group_idx)
             if not block_ids:
                 continue
             tasks = self._store().put(
                 block_indices=block_ids,
                 block_hashs=block_hashes,
-                layer_names=[layer_name],
+                layer_names=layer_keys,
             )
             self._current_put_tasks.setdefault(req_id, []).append(tasks)
 
