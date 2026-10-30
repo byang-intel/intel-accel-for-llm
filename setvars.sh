@@ -167,6 +167,7 @@ validate_omp_config "$MIN_RANK_CPU_COUNT" || return 1 2>/dev/null || exit 1
 # Prepended to LD_PRELOAD by the example and benchmark scripts. The vLLM CPU image ships libiomp5 in
 # its venv instead: IAXL_LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so
 export IAXL_LD_PRELOAD=${IAXL_LD_PRELOAD:-/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/usr/local/lib/libiomp5.so}
+export TCMALLOC_RELEASE_RATE=${TCMALLOC_RELEASE_RATE:-0} # Keep freed memory in tcmalloc instead of returning it to the OS
 
 # ---- Intel DSA (host<->device copy accelerator, CUDA only) ------------------
 export IAXL_DSA_GD_RESET_ON_DESTROY=${IAXL_DSA_GD_RESET_ON_DESTROY:-0} # Large BAR with stable tensor VAs can keep this off for better performance (0/1)
