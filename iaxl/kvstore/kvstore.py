@@ -458,10 +458,11 @@ class KVStoreLocal:
         with self._evict_cond:
             evicting = len(self._evicting)
         logger.info(
-            "[monitor][rank0] | mem pool %.2f/%.2fG (%.0f%%) %d grp | "
+            "[monitor][rank%d] | mem pool %.2f/%.2fG (%.0f%%) %d grp | "
             "zip/raw %.2f/%.2fG (%.2f) | "
             "evict %s/%d | "
             "host mem %.1f/%.1fG",
+            self.rank,
             zip_bytes / gib, cap / gib, zip_bytes / cap * 100 if cap else 0.0, st["group_count"],
             zip_bytes / gib, zip_bytes / ratio / gib if ratio else 0.0, ratio,
             "on" if self._evict_enabled else "off", st["evictions"],
