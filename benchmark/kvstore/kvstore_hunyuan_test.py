@@ -6,7 +6,7 @@
 
 一、数据来源
 ----------
-dump 目录(见 hunyuan/int4/KV_CACHE_DUMP_FORMAT.md)中每层一个 ``layer_NNN.pt``，
+dump 目录(格式见同目录下 HUNYUAN_INT4_KV_CACHE_DUMP_FORMAT.md)中每层一个 ``layer_NNN.pt``，
 保存量化后 KV cache 的**原始字节**(torch.uint8)：
 
 - MLA KV：``[tokens, 448]``，每行一个 token(78 层都有)；
