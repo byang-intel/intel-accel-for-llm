@@ -10,17 +10,18 @@ MLA KV 为 ``[tokens, 448]`` 的 torch.uint8 原始字节。
 
 在 dev 容器内、仓库根目录下运行：
 
-    python3 tests/hunyuan-kv-zip-int4.py [--dump-dir DIR] [--layer N] [--block-size N]
-                                         [--max-blocks N] [--mla-shuffle MODE ...]
+    python3 tests/hunyuan-kv-zip-int4.py [--dump-dir DIR] [--layers N ...] [--block-size N]
+                                         [--max-blocks N] [--iters N] [--mla-shuffle MODE ...]
 
 命令行参数：
     --dump-dir      dump 目录(默认 hunyuan/int4/merged)
-    --layer         测试的层号(默认 1)
+    --layers        测试的层号，可多选(默认目录下全部 layer_NNN.pt)
     --block-size    每个 block 的 token 数(默认 64)
-    --max-blocks    最多测试的 block 数(默认 0 = 全部)
+    --max-blocks    每层最多测试的 block 数(默认 0 = 全部)
+    --iters         每次计时重复调用 compress/decompress 的次数(默认 5)，避免单次耗时过短
     --mla-shuffle   要测试的重排模式，可多选(默认 none planes planes_cm)
 压缩后端由 IAXL_*_ZIP_ENABLE 选择，默认开启 CPU 后端；回环要求逐字节一致，所以关闭有损截断。
-任何一处数据不一致都会以非零退出码结束。
+每层逐一加载、压缩、解压、比对，最后汇总所有层的压缩比与吞吐；任何一处数据不一致都会以非零退出码结束。
 
 一、block 内字节重排(--mla-shuffle；代码与说明拷贝自 benchmark/kvstore/kvstore_hunyuan_test.py)
 --------------------------------------------------------------------------------
@@ -80,9 +81,10 @@ DEFLATE = LZ77(在 32 KiB 窗口里找重复串) + Huffman(对一段数据用一
 
 import argparse
 import os
+import re
 import sys
 import time
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 os.environ.setdefault("IAXL_CPU_ZIP_ENABLE", "1")
 os.environ["IAXL_KV_LOSSY_TRUNC"] = "0"
@@ -171,9 +173,12 @@ def unshuffle_mla_blocks(blocks: torch.Tensor, block_size: int, mode: str) -> to
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="kv_zip round trip on the Hunyuan INT4 MLA dump")
     parser.add_argument("--dump-dir", default=DEFAULT_DUMP_DIR, help="directory with layer_NNN.pt")
-    parser.add_argument("--layer", type=int, default=1, help="layer index to load")
+    parser.add_argument(
+        "--layers", type=int, nargs="+", default=None, help="layer indices to test (default: all in --dump-dir)"
+    )
     parser.add_argument("--block-size", type=int, default=64, help="tokens per block")
-    parser.add_argument("--max-blocks", type=int, default=0, help="limit the number of blocks (0 = all)")
+    parser.add_argument("--max-blocks", type=int, default=0, help="limit the number of blocks per layer (0 = all)")
+    parser.add_argument("--iters", type=int, default=5, help="compress/decompress calls per timing sample")
     parser.add_argument(
         "--mla-shuffle",
         nargs="+",
@@ -181,7 +186,19 @@ def parse_args() -> argparse.Namespace:
         default=list(MLA_SHUFFLES),
         help="in-block byte shuffle modes to test",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.iters < 1:
+        parser.error("--iters must be >= 1")
+    return args
+
+
+def list_layers(dump_dir: str) -> List[int]:
+    layers = []
+    for name in os.listdir(dump_dir):
+        m = re.fullmatch(r"layer_(\d+)\.pt", name)
+        if m:
+            layers.append(int(m.group(1)))
+    return sorted(layers)
 
 
 def load_mla_blocks(dump_dir: str, layer: int, block_size: int, max_blocks: int) -> torch.Tensor:
@@ -205,71 +222,99 @@ def check_shuffle_roundtrip(blocks: torch.Tensor, block_size: int, mode: str) ->
         raise RuntimeError(f"{mode}: shuffle/unshuffle round trip mismatch")
 
 
-def zip_roundtrip(blocks: torch.Tensor, block_size: int, mode: str) -> Tuple[float, float, float]:
+def zip_roundtrip(blocks: torch.Tensor, block_size: int, mode: str, iters: int) -> Tuple[int, float, float]:
     """shuffle -> compress_tensors -> decompress_tensors -> unshuffle.
 
-    Returns (ratio, zip_seconds, unzip_seconds); the timings cover only the torch_ext calls.
+    Each torch_ext call is repeated ``iters`` times; returns
+    (compressed_bytes, total_zip_seconds, total_unzip_seconds) covering only the torch_ext calls.
     """
     shuffled = shuffle_mla_blocks(blocks, block_size, mode)
-    # Inputs: contiguous CPU tensors of one dtype and size, one per KV block.
-    # Segmented compression uses the inputs as scratch, so hand over copies.
-    tensors = [b.clone() for b in shuffled]
 
-    # Compress: one uint8 tensor (the block) per input.
-    t0 = time.perf_counter()
-    zipped = torch_ext.compress_tensors(tensors)
-    zip_s = time.perf_counter() - t0
-    if len(zipped) != len(tensors):
-        raise RuntimeError(f"{mode}: compress_tensors returned {len(zipped)} blocks for {len(tensors)} inputs")
+    # Compress: one uint8 tensor (the block) per input. Inputs must be contiguous CPU
+    # tensors of one dtype and size; segmented compression uses them as scratch, so
+    # every iteration gets fresh copies (cloned outside the timed region).
+    zip_s = 0.0
+    for _ in range(iters):
+        tensors = [b.clone() for b in shuffled]
+        t0 = time.perf_counter()
+        zipped = torch_ext.compress_tensors(tensors)
+        zip_s += time.perf_counter() - t0
+    if len(zipped) != len(shuffled):
+        raise RuntimeError(f"{mode}: compress_tensors returned {len(zipped)} blocks for {len(shuffled)} inputs")
     if any(z.dtype != torch.uint8 for z in zipped):
         raise RuntimeError(f"{mode}: compressed blocks are not uint8")
 
     # Decompress into preallocated tensors of the original shape and dtype.
     outs = [torch.empty_like(b) for b in shuffled]
-    t0 = time.perf_counter()
-    torch_ext.decompress_tensors(zipped, outs)
-    unzip_s = time.perf_counter() - t0
+    unzip_s = 0.0
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        torch_ext.decompress_tensors(zipped, outs)
+        unzip_s += time.perf_counter() - t0
     restored = unshuffle_mla_blocks(torch.stack(outs), block_size, mode)
     if not torch.equal(restored, blocks):
         raise RuntimeError(f"{mode}: data mismatch after compress/decompress round trip")
 
-    zip_bytes = sum(z.numel() for z in zipped)
-    return blocks.nbytes / zip_bytes, zip_s, unzip_s
+    return sum(z.numel() for z in zipped), zip_s, unzip_s
+
+
+def fmt_result(tag: str, mode: str, raw_bytes: int, zip_bytes: int, zip_s: float, unzip_s: float, iters: int) -> str:
+    ratio = raw_bytes / zip_bytes
+    gb = raw_bytes * iters / 1e9
+    return (
+        f"{tag} {mode:<10} ratio {ratio:.3f}x ({1 - 1 / ratio:.1%} saved)  "
+        f"zip {gb / zip_s:6.2f} GB/s  unzip {gb / unzip_s:6.2f} GB/s"
+    )
 
 
 def main() -> int:
     args = parse_args()
-    path = os.path.join(args.dump_dir, f"layer_{args.layer:03d}.pt")
-    if not os.path.exists(path):
-        print(f"error: dump not found: {path} (use --dump-dir)", file=sys.stderr)
+    if not os.path.isdir(args.dump_dir):
+        print(f"error: dump dir not found: {args.dump_dir} (use --dump-dir)", file=sys.stderr)
         return 2
+    layers = args.layers if args.layers else list_layers(args.dump_dir)
+    if not layers:
+        print(f"error: no layer_NNN.pt found in {args.dump_dir}", file=sys.stderr)
+        return 2
+    for layer in layers:
+        path = os.path.join(args.dump_dir, f"layer_{layer:03d}.pt")
+        if not os.path.exists(path):
+            print(f"error: dump not found: {path}", file=sys.stderr)
+            return 2
 
-    blocks = load_mla_blocks(args.dump_dir, args.layer, args.block_size, args.max_blocks)
-    print(
-        f"[dump] layer {args.layer}: {blocks.shape[0]} blocks x {args.block_size} tokens x "
-        f"{MLA_ROW_BYTES} B = {blocks.nbytes / 2**20:.1f} MiB"
-    )
+    print(f"[config] layers={len(layers)} block_size={args.block_size} iters={args.iters} modes={' '.join(args.mla_shuffle)}")
 
+    # Per mode: [raw_bytes, zip_bytes, zip_seconds, unzip_seconds] summed over layers.
+    totals: Dict[str, List[float]] = {mode: [0, 0, 0.0, 0.0] for mode in args.mla_shuffle}
+    warmed_up = False
     try:
-        for mode in args.mla_shuffle:
-            check_shuffle_roundtrip(blocks, args.block_size, mode)
-        print(f"[shuffle] round trip OK: {' '.join(args.mla_shuffle)}")
+        for layer in layers:
+            blocks = load_mla_blocks(args.dump_dir, layer, args.block_size, args.max_blocks)
+            for mode in args.mla_shuffle:
+                check_shuffle_roundtrip(blocks, args.block_size, mode)
 
-        # One untimed pass so backend init / thread pool spin-up stay out of the numbers.
-        zip_roundtrip(blocks[: min(WARMUP_BLOCKS, blocks.shape[0])], args.block_size, args.mla_shuffle[0])
+            if not warmed_up:
+                # One untimed pass so backend init / thread pool spin-up stay out of the numbers.
+                zip_roundtrip(blocks[: min(WARMUP_BLOCKS, blocks.shape[0])], args.block_size, args.mla_shuffle[0], 1)
+                warmed_up = True
 
-        gb = blocks.nbytes / 1e9
-        for mode in args.mla_shuffle:
-            ratio, zip_s, unzip_s = zip_roundtrip(blocks, args.block_size, mode)
-            print(
-                f"[zip] {mode:<10} ratio {ratio:.3f}x ({1 - 1 / ratio:.1%} saved)  "
-                f"zip {gb / zip_s:6.2f} GB/s ({zip_s * 1e3:.1f} ms)  "
-                f"unzip {gb / unzip_s:6.2f} GB/s ({unzip_s * 1e3:.1f} ms)  verify OK"
-            )
+            tag = f"[layer {layer:03d}] {blocks.shape[0]:5d} blocks {blocks.nbytes / 2**20:6.1f} MiB"
+            for mode in args.mla_shuffle:
+                zip_bytes, zip_s, unzip_s = zip_roundtrip(blocks, args.block_size, mode, args.iters)
+                print(fmt_result(tag, mode, blocks.nbytes, zip_bytes, zip_s, unzip_s, args.iters))
+                t = totals[mode]
+                t[0] += blocks.nbytes
+                t[1] += zip_bytes
+                t[2] += zip_s
+                t[3] += unzip_s
     except RuntimeError as e:
         print(f"FAILED: {e}", file=sys.stderr)
         return 1
 
+    raw_total = next(iter(totals.values()))[0]
+    tag = f"[total {len(layers)} layers {raw_total / 2**30:.2f} GiB]"
+    for mode, (raw, zb, zs, us) in totals.items():
+        print(fmt_result(tag, mode, raw, zb, zs, us, args.iters))
     print("PASSED")
     return 0
 
