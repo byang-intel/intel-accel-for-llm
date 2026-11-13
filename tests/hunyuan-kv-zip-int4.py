@@ -84,7 +84,7 @@ import os
 import re
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 os.environ.setdefault("IAXL_CPU_ZIP_ENABLE", "1")
 os.environ["IAXL_KV_LOSSY_TRUNC"] = "0"
@@ -169,10 +169,16 @@ def unshuffle_mla_blocks(blocks: torch.Tensor, block_size: int, mode: str) -> to
 
 # --- 测试 -------------------------------------------------------------------------
 
+ShuffleFn = Callable[[torch.Tensor, int, str], torch.Tensor]
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="kv_zip round trip on the Hunyuan INT4 MLA dump")
-    parser.add_argument("--dump-dir", default=DEFAULT_DUMP_DIR, help="directory with layer_NNN.pt")
+
+def parse_args(
+    description: str = "kv_zip round trip on the Hunyuan INT4 MLA dump",
+    dump_dir: str = DEFAULT_DUMP_DIR,
+    shuffles: Sequence[str] = MLA_SHUFFLES,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--dump-dir", default=dump_dir, help="directory with layer_NNN.pt")
     parser.add_argument(
         "--layers", type=int, nargs="+", default=None, help="layer indices to test (default: all in --dump-dir)"
     )
@@ -182,8 +188,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mla-shuffle",
         nargs="+",
-        choices=MLA_SHUFFLES,
-        default=list(MLA_SHUFFLES),
+        choices=shuffles,
+        default=list(shuffles),
         help="in-block byte shuffle modes to test",
     )
     args = parser.parse_args()
@@ -201,34 +207,49 @@ def list_layers(dump_dir: str) -> List[int]:
     return sorted(layers)
 
 
-def load_mla_blocks(dump_dir: str, layer: int, block_size: int, max_blocks: int) -> torch.Tensor:
-    """layer_NNN.pt 中的 MLA cache -> CPU uint8 [num_blocks, block_size*448]."""
+def load_mla_blocks(
+    dump_dir: str, layer: int, block_size: int, max_blocks: int, row_bytes: int = MLA_ROW_BYTES
+) -> torch.Tensor:
+    """layer_NNN.pt 中的 MLA cache([tokens, row_bytes] uint8) -> CPU uint8 [num_blocks, block_size*row_bytes]."""
     path = os.path.join(dump_dir, f"layer_{layer:03d}.pt")
     data = torch.load(path, map_location="cpu", weights_only=True)
     tensor = next(e["tensor"] for e in data["caches"].values() if e["tensor"].dim() == 2)
-    assert tensor.dtype == torch.uint8 and tensor.shape[1] == MLA_ROW_BYTES, tensor.shape
-    blocks = view_as_blocks(tensor, block_size * MLA_ROW_BYTES)
+    assert tensor.dtype == torch.uint8 and tensor.shape[1] == row_bytes, tensor.shape
+    blocks = view_as_blocks(tensor, block_size * row_bytes)
     if max_blocks > 0:
         blocks = blocks[:max_blocks]
     return blocks
 
 
-def check_shuffle_roundtrip(blocks: torch.Tensor, block_size: int, mode: str) -> None:
-    shuffled = shuffle_mla_blocks(blocks, block_size, mode)
+def check_shuffle_roundtrip(
+    blocks: torch.Tensor,
+    block_size: int,
+    mode: str,
+    shuffle: ShuffleFn = shuffle_mla_blocks,
+    unshuffle: ShuffleFn = unshuffle_mla_blocks,
+) -> None:
+    shuffled = shuffle(blocks, block_size, mode)
     if shuffled.shape != blocks.shape:
         raise RuntimeError(f"{mode}: shuffle changed shape {tuple(blocks.shape)} -> {tuple(shuffled.shape)}")
-    restored = unshuffle_mla_blocks(shuffled, block_size, mode)
+    restored = unshuffle(shuffled, block_size, mode)
     if not torch.equal(restored, blocks):
         raise RuntimeError(f"{mode}: shuffle/unshuffle round trip mismatch")
 
 
-def zip_roundtrip(blocks: torch.Tensor, block_size: int, mode: str, iters: int) -> Tuple[int, float, float]:
+def zip_roundtrip(
+    blocks: torch.Tensor,
+    block_size: int,
+    mode: str,
+    iters: int,
+    shuffle: ShuffleFn = shuffle_mla_blocks,
+    unshuffle: ShuffleFn = unshuffle_mla_blocks,
+) -> Tuple[int, float, float]:
     """shuffle -> compress_tensors -> decompress_tensors -> unshuffle.
 
     Each torch_ext call is repeated ``iters`` times; returns
     (compressed_bytes, total_zip_seconds, total_unzip_seconds) covering only the torch_ext calls.
     """
-    shuffled = shuffle_mla_blocks(blocks, block_size, mode)
+    shuffled = shuffle(blocks, block_size, mode)
 
     # Compress: one uint8 tensor (the block) per input. Inputs must be contiguous CPU
     # tensors of one dtype and size; segmented compression uses them as scratch, so
@@ -251,7 +272,7 @@ def zip_roundtrip(blocks: torch.Tensor, block_size: int, mode: str, iters: int) 
         t0 = time.perf_counter()
         torch_ext.decompress_tensors(zipped, outs)
         unzip_s += time.perf_counter() - t0
-    restored = unshuffle_mla_blocks(torch.stack(outs), block_size, mode)
+    restored = unshuffle(torch.stack(outs), block_size, mode)
     if not torch.equal(restored, blocks):
         raise RuntimeError(f"{mode}: data mismatch after compress/decompress round trip")
 
@@ -267,8 +288,13 @@ def fmt_result(tag: str, mode: str, raw_bytes: int, zip_bytes: int, zip_s: float
     )
 
 
-def main() -> int:
-    args = parse_args()
+def run(
+    args: argparse.Namespace,
+    row_bytes: int = MLA_ROW_BYTES,
+    shuffle: ShuffleFn = shuffle_mla_blocks,
+    unshuffle: ShuffleFn = unshuffle_mla_blocks,
+) -> int:
+    """Per layer: load -> shuffle check -> timed zip/unzip round trip; prints per-layer and total results."""
     if not os.path.isdir(args.dump_dir):
         print(f"error: dump dir not found: {args.dump_dir} (use --dump-dir)", file=sys.stderr)
         return 2
@@ -282,25 +308,30 @@ def main() -> int:
             print(f"error: dump not found: {path}", file=sys.stderr)
             return 2
 
-    print(f"[config] layers={len(layers)} block_size={args.block_size} iters={args.iters} modes={' '.join(args.mla_shuffle)}")
+    print(
+        f"[config] layers={len(layers)} row_bytes={row_bytes} block_size={args.block_size} "
+        f"iters={args.iters} modes={' '.join(args.mla_shuffle)}"
+    )
 
     # Per mode: [raw_bytes, zip_bytes, zip_seconds, unzip_seconds] summed over layers.
     totals: Dict[str, List[float]] = {mode: [0, 0, 0.0, 0.0] for mode in args.mla_shuffle}
     warmed_up = False
     try:
         for layer in layers:
-            blocks = load_mla_blocks(args.dump_dir, layer, args.block_size, args.max_blocks)
+            blocks = load_mla_blocks(args.dump_dir, layer, args.block_size, args.max_blocks, row_bytes)
             for mode in args.mla_shuffle:
-                check_shuffle_roundtrip(blocks, args.block_size, mode)
+                check_shuffle_roundtrip(blocks, args.block_size, mode, shuffle, unshuffle)
 
             if not warmed_up:
                 # One untimed pass so backend init / thread pool spin-up stay out of the numbers.
-                zip_roundtrip(blocks[: min(WARMUP_BLOCKS, blocks.shape[0])], args.block_size, args.mla_shuffle[0], 1)
+                zip_roundtrip(
+                    blocks[: min(WARMUP_BLOCKS, blocks.shape[0])], args.block_size, args.mla_shuffle[0], 1, shuffle, unshuffle
+                )
                 warmed_up = True
 
             tag = f"[layer {layer:03d}] {blocks.shape[0]:5d} blocks {blocks.nbytes / 2**20:6.1f} MiB"
             for mode in args.mla_shuffle:
-                zip_bytes, zip_s, unzip_s = zip_roundtrip(blocks, args.block_size, mode, args.iters)
+                zip_bytes, zip_s, unzip_s = zip_roundtrip(blocks, args.block_size, mode, args.iters, shuffle, unshuffle)
                 print(fmt_result(tag, mode, blocks.nbytes, zip_bytes, zip_s, unzip_s, args.iters))
                 t = totals[mode]
                 t[0] += blocks.nbytes
@@ -317,6 +348,10 @@ def main() -> int:
         print(fmt_result(tag, mode, raw, zb, zs, us, args.iters))
     print("PASSED")
     return 0
+
+
+def main() -> int:
+    return run(parse_args())
 
 
 if __name__ == "__main__":
