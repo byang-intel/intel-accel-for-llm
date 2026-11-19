@@ -291,6 +291,18 @@ static int dsa_init(void) {
         fprintf(stderr, "no WQ configured in $" DSA_WQS_ENV "\n");
         goto out;
     }
+    for (w = 0; w < num_wq; w++) {
+        char path[96];
+
+        snprintf(path, sizeof(path), "/sys/bus/dsa/devices/%s", g_wq_name[w]);
+        if (access(path, F_OK)) {
+            fprintf(stderr,
+                    "dsa_init: unknown WQ \"%s\" in $" DSA_WQS_ENV
+                    " (names are comma or space separated, e.g. wq0.0,wq2.0)\n",
+                    g_wq_name[w]);
+            goto out;
+        }
+    }
 
     g_max_xfer = dsa_read_wq_attr("max_transfer_size", DSA_MAX_XFER);
     g_max_batch = dsa_read_wq_attr("max_batch_size", 1);
