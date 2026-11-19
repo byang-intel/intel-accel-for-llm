@@ -12,6 +12,7 @@ Example:
 import argparse
 import os
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -32,6 +33,19 @@ from iaxl.utils.flamegraph import PerfRecorder
 
 DEFAULT_FRAG_SIZES = "1K,4K,8K,16K,32K,64K,128K,256K,512K,1M,2M"
 DEFAULT_OUTPUT_DIR = "/_data/tensor_xfer_benchmark"
+# BIDIR issues H2D and D2H at the same time on two streams (PCIe full duplex) and
+# reports each direction separately as "BIDIR H2D" / "BIDIR D2H".
+DIRECTIONS = {
+    "h2d": ("H2D",),
+    "d2h": ("D2H",),
+    "both": ("H2D", "D2H"),
+    "bidir": ("BIDIR",),
+    "all": ("H2D", "D2H", "BIDIR"),
+}
+BIDIR_METHODS = ("cuda", "batch")
+# Passes queued ahead per stream; keeps both directions busy without a long drain tail.
+BIDIR_LOOKAHEAD = 2
+PLOT_DIRECTIONS = ("H2D", "D2H", "BIDIR H2D", "BIDIR D2H")
 METHODS = {
     "cuda": "CUDA Copy",
     "batch": "CUDA Copy Batch",
@@ -145,6 +159,29 @@ def build_3d_batch_ops(
     return operations
 
 
+def batch_copy(operations: list[Any]) -> None:
+    result = cuda_runtime.cudaMemcpy3DBatchAsync(
+        len(operations), operations, 0, torch.cuda.current_stream().cuda_stream
+    )
+    if result[0] != cuda_runtime.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaMemcpy3DBatchAsync failed: {result[0]}")
+
+
+def slice_copy(
+    src_tensor: torch.Tensor,
+    dst_tensor: torch.Tensor,
+    src_indices: list[int],
+    dst_indices: list[int],
+    frag_elements: int,
+) -> None:
+    for src_index, dst_index in zip(src_indices, dst_indices):
+        src_start = src_index * frag_elements
+        dst_start = dst_index * frag_elements
+        dst_tensor[dst_start : dst_start + frag_elements].copy_(
+            src_tensor[src_start : src_start + frag_elements], non_blocking=True
+        )
+
+
 @triton.jit
 def copy_kernel(
     src,
@@ -235,8 +272,12 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
     expected = expected.flatten()
 
     results = []
-    directions = ("H2D", "D2H") if args.direction == "both" else (args.direction.upper(),)
-    for direction in directions:
+    for direction in DIRECTIONS[args.direction]:
+        if direction == "BIDIR":
+            results.extend(
+                run_bidir(source, expected, src_indices, dst_indices, frag_bytes, args)
+            )
+            continue
         h2d = direction == "H2D"
         label = (direction, format_size(frag_bytes))
         host = source.clone().pin_memory()
@@ -259,12 +300,7 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
         if "cuda" in args.methods:
 
             def cuda_copy():
-                for src_index, dst_index in zip(src_indices, dst_indices):
-                    src_start = src_index * frag_elements
-                    dst_start = dst_index * frag_elements
-                    dst_tensor[dst_start : dst_start + frag_elements].copy_(
-                        src_tensor[src_start : src_start + frag_elements], non_blocking=True
-                    )
+                slice_copy(src_tensor, dst_tensor, src_indices, dst_indices, frag_elements)
 
             clear_destination()
             elapsed = measure(
@@ -289,11 +325,7 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
             batch_stream = torch.cuda.Stream()
 
             def cuda_3d_batch_copy():
-                result = cuda_runtime.cudaMemcpy3DBatchAsync(
-                    len(batch_operations), batch_operations, 0, batch_stream.cuda_stream
-                )
-                if result[0] != cuda_runtime.cudaError_t.cudaSuccess:
-                    raise RuntimeError(f"cudaMemcpy3DBatchAsync failed: {result[0]}")
+                batch_copy(batch_operations)
 
             clear_destination()
             with torch.cuda.stream(batch_stream):
@@ -358,10 +390,135 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
     return results
 
 
+def measure_bidir(
+    passes: tuple[Callable[[], None], Callable[[], None]],
+    streams: tuple[torch.cuda.Stream, torch.cuda.Stream],
+    *,
+    seconds: float,
+    warmup: int,
+    label: tuple[str, ...] = (),
+) -> list[tuple[float, int]]:
+    """Run both passes concurrently for `seconds`, each stream at its own pace.
+
+    Returns (milliseconds, passes completed) per stream, timed with events on that
+    stream, so each direction's bandwidth is measured while the other is active.
+    """
+    for _ in range(warmup):
+        for stream, run_pass in zip(streams, passes):
+            with torch.cuda.stream(stream):
+                run_pass()
+    torch.cuda.synchronize()
+
+    if RECORDER is not None:
+        RECORDER.start(label)
+    if SYNC is not None:
+        SYNC()
+    starts = [torch.cuda.Event(enable_timing=True) for _ in streams]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in streams]
+    pending: list[deque[torch.cuda.Event]] = [deque() for _ in streams]
+    rounds = [0 for _ in streams]
+    for stream, start in zip(streams, starts):
+        start.record(stream)
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        for index, (stream, run_pass) in enumerate(zip(streams, passes)):
+            queue = pending[index]
+            while queue and queue[0].query():
+                queue.popleft()
+            if len(queue) >= BIDIR_LOOKAHEAD:
+                continue
+            with torch.cuda.stream(stream):
+                run_pass()
+                done = torch.cuda.Event()
+                done.record(stream)
+                queue.append(done)
+            rounds[index] += 1
+    for stream, end in zip(streams, ends):
+        end.record(stream)
+    torch.cuda.synchronize()
+    if RECORDER is not None:
+        RECORDER.stop()
+    return [
+        (start.elapsed_time(end), count) for start, end, count in zip(starts, ends, rounds)
+    ]
+
+
+def run_bidir(
+    source: torch.Tensor,
+    expected: torch.Tensor,
+    src_indices: list[int],
+    dst_indices: list[int],
+    frag_bytes: int,
+    args: argparse.Namespace,
+) -> list[Result]:
+    frag_elements = frag_bytes // 2
+    pass_bytes = source.nbytes
+    label = ("BIDIR", format_size(frag_bytes))
+    host_src = source.clone().pin_memory()
+    host_dst = torch.empty(source.numel(), dtype=torch.int16, pin_memory=True)
+    gpu_src = source.cuda()
+    gpu_dst = torch.empty_like(gpu_src)
+    torch.cuda.synchronize()
+    streams = (torch.cuda.Stream(), torch.cuda.Stream())
+
+    def clear_destinations():
+        gpu_dst.zero_()
+        host_dst.zero_()
+        torch.cuda.synchronize()
+
+    def valid() -> list[bool]:
+        torch.cuda.synchronize()
+        return [torch.equal(gpu_dst.cpu(), expected), torch.equal(host_dst, expected)]
+
+    def record(method: str, timings: list[tuple[float, int]]) -> list[Result]:
+        checks = valid()
+        return [
+            Result(method, direction, elapsed, count * pass_bytes, ok)
+            for direction, (elapsed, count), ok in zip(("BIDIR H2D", "BIDIR D2H"), timings, checks)
+        ]
+
+    results = []
+    if "cuda" in args.methods:
+        clear_destinations()
+        timings = measure_bidir(
+            (
+                lambda: slice_copy(host_src, gpu_dst, src_indices, dst_indices, frag_elements),
+                lambda: slice_copy(gpu_src, host_dst, src_indices, dst_indices, frag_elements),
+            ),
+            streams,
+            seconds=args.bidir_seconds,
+            warmup=args.warmup,
+            label=label + ("CUDA Copy",),
+        )
+        results.extend(record("CUDA Copy", timings))
+
+    if "batch" in args.methods:
+        src_byte_offsets = [index * frag_bytes for index in src_indices]
+        dst_byte_offsets = [index * frag_bytes for index in dst_indices]
+        h2d_operations = build_3d_batch_ops(
+            host_src.data_ptr(), gpu_dst.data_ptr(), src_byte_offsets, dst_byte_offsets, frag_bytes
+        )
+        d2h_operations = build_3d_batch_ops(
+            gpu_src.data_ptr(), host_dst.data_ptr(), src_byte_offsets, dst_byte_offsets, frag_bytes
+        )
+
+        clear_destinations()
+        timings = measure_bidir(
+            (lambda: batch_copy(h2d_operations), lambda: batch_copy(d2h_operations)),
+            streams,
+            seconds=args.bidir_seconds,
+            warmup=args.warmup,
+            label=label + ("cudaMemcpy3DBatchAsync",),
+        )
+        results.extend(record("CUDA Copy Batch", timings))
+
+    return results
+
+
 def plot_results(
     results: dict[str, dict[int, list[Result]]], frag_sizes: list[int], path: str
 ) -> None:
-    directions = [direction for direction in ("H2D", "D2H") if direction in results]
+    directions = [direction for direction in PLOT_DIRECTIONS if direction in results]
     figure, axes = plt.subplots(
         len(directions), 1, figsize=(8, 5 * len(directions)), squeeze=False
     )
@@ -393,7 +550,11 @@ def plot_results(
         axis.set_xticklabels([format_size(size) for size in frag_sizes], rotation=45)
         axis.set_xlabel("Fragment size")
         axis.set_ylabel("GB/s")
-        axis.set_title(direction)
+        axis.set_title(
+            f"{direction} (concurrent with the other direction)"
+            if direction.startswith("BIDIR")
+            else direction
+        )
         axis.grid(True, which="both", linestyle=":", alpha=0.5)
         axis.legend(fontsize=8)
 
@@ -409,7 +570,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--total-gib", type=float, default=0.1)
     parser.add_argument("--frag-sizes", type=parse_sizes, default=DEFAULT_FRAG_SIZES)
-    parser.add_argument("--direction", choices=("h2d", "d2h", "both"), default="both")
+    parser.add_argument(
+        "--direction",
+        choices=tuple(DIRECTIONS),
+        default="both",
+        help="bidir runs H2D and D2H concurrently (only "
+        f"{', '.join(BIDIR_METHODS)}); all runs h2d, d2h and bidir",
+    )
+    parser.add_argument(
+        "--bidir-seconds",
+        type=float,
+        default=1.0,
+        metavar="SEC",
+        help="how long both directions run concurrently in bidir mode; the ms column "
+        "then shows this window and GB/s is per direction",
+    )
     parser.add_argument(
         "--methods",
         nargs="+",
@@ -462,6 +637,8 @@ def parse_args(
     if isinstance(args.frag_sizes, str):
         args.frag_sizes = parse_sizes(args.frag_sizes)
     args.methods = [name for group in args.methods for name in group] if args.methods else list(METHODS)
+    if args.direction == "bidir" and not any(name in BIDIR_METHODS for name in args.methods):
+        parser.error(f"--direction bidir supports only: {', '.join(BIDIR_METHODS)}")
     if not torch.cuda.is_available():
         parser.error("CUDA is not available")
 #    if os.environ.get("IAXL_DSA_GD_ENABLE", "0").lower() not in ("1", "true", "yes", "on"):
