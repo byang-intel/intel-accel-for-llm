@@ -66,7 +66,7 @@ done <<<"$recipe_qat_vfs"
 if [[ -n "${KVSHRINK_DSA_DEVICES:-}" && -d /dev/dsa ]]; then
     DOCKER_RUN_ARGS+=(--device /dev/dsa)
     [[ -e /dev/gdrdrv ]] && DOCKER_RUN_ARGS+=(--device /dev/gdrdrv)
-    ENV_VARS+=(IAXL_DSA_GD_ENABLE KVSHRINK_DSA_DEVICES)
+    ENV_VARS+=(IAXL_DSA_GD_ENABLE IAXL_DSA_GD_H2D_ONLY KVSHRINK_DSA_DEVICES)
 fi
 if env_truthy "$IAXL_IAA_ZIP_ENABLE" && [[ -d /dev/iax ]]; then
     DOCKER_RUN_ARGS+=(--device /dev/iax)

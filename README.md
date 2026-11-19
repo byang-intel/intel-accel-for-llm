@@ -76,6 +76,7 @@ Common settings in `setvars.sh`. Other variables in `setvars.sh` are advanced se
 | Accelerators | `IAXL_IAA_ZIP_ENABLE` | `0` | Enable Intel IAA compression workers via Intel QPL (`0`/`1`). Can be combined with QAT; each block records whether IAA can decode it |
 | Accelerators | `IAXL_CPU_ZIP_ENABLE` | `0` | Enable CPU compression workers (`0`/`1`). CPU compression uses a lot of CPU time, so leave it off when the QAT/IAA accelerators already provide enough throughput |
 | Accelerators | `IAXL_DSA_GD_ENABLE` | `0` | Enable Intel DSA + GDRCopy transfers (`0`/`1`) |
+| Accelerators | `IAXL_DSA_GD_H2D_ONLY` | `0` | With DSA enabled, use it for H2D only and copy D2H with CUDA (`0`/`1`) |
 | Compression | `IAXL_KV_COMPRESSION` | `1` | Enable DEFLATE compression of the KV cache (`0`/`1`) |
 | Compression | `IAXL_ZIP_LEVEL` | `1` | Compression level for all zip backends, from `1` (fastest) to `9` (best ratio). QAT and CPU use the level as is. IAA hardware only supports level 1, so IAA ignores this setting. Keep the default `1`: higher levels barely improve the KV cache compression ratio but make compression much slower |
 | Compression | `IAXL_KV_DATA_SHUFFLE` | `1` | Byte-shuffle BF16 data before compression (`0`/`1`). Slightly lowers compression throughput, but improves the compression ratio and decompression throughput |

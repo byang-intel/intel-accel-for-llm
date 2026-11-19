@@ -264,12 +264,16 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
                 inner_size / 1024.0, chunk_indices.size());
     });
 #if defined(DSA_SUPPORT)
-
-    if (dsa_copy_chunks_batch(x->gpu_bar_base, chunk_stride, outer_dims, inner_size,
+    // IAXL_DSA_GD_H2D_ONLY: D2H reads over the BAR are slower on DSA than on the GPU copy
+    // engine, so leave them to CUDA and keep DSA for H2D.
+    const bool use_dsa = h2d || !envs.IAXL_DSA_GD_H2D_ONLY;
+    if (use_dsa &&
+        dsa_copy_chunks_batch(x->gpu_bar_base, chunk_stride, outer_dims, inner_size,
                               outer_block_size, h2d, chunk_indices, cpu_ptrs, x->dsa_ticket)) {
         static std::once_flag dsa_noted;
         std::call_once(dsa_noted, [] {
-            fprintf(stderr, "[kv_xfer] copy_chunks_batch: using Intel DSA backend\n");
+            fprintf(stderr, "[kv_xfer] copy_chunks_batch: using Intel DSA backend%s\n",
+                    envs.IAXL_DSA_GD_H2D_ONLY ? " for H2D (D2H via CUDA)" : "");
         });
         return;
     }
