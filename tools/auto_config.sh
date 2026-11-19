@@ -268,9 +268,9 @@ qat_auto_detect() {
 
 dsa_auto_detect() {
     local tp_size=${1:-${TP_SIZE:-}}
-    local gpu_output rank gpu_index pci_bus gpu_numa dsa_path dsa_name dsa_numa dsa_id wq_path
+    local gpu_output rank pass gpu_index pci_bus gpu_numa dsa_path dsa_name dsa_numa dsa_id wq_path
     local selected_dsa selected_wq result
-    local -a gpu_rows=() dsa_paths=() used_dsa=() rank_wqs=() candidate_wqs=()
+    local -a gpu_rows=() dsa_paths=() used_dsa=() rank_wqs=() rank_numa=() rank_gpu=() candidate_wqs=()
 
     gpu_output=$(gpu_rows "$tp_size") || return 1
     mapfile -t gpu_rows <<<"$gpu_output"
@@ -287,38 +287,48 @@ dsa_auto_detect() {
     for ((rank = 0; rank < tp_size; rank++)); do
         read -r gpu_index pci_bus gpu_numa < <(gpu_info "${gpu_rows[$rank]}") || return 1
         echo "KVShrink GPU rank $rank: index=$gpu_index pci=$pci_bus numa=$gpu_numa" >&2
+        rank_numa+=("$gpu_numa")
+        rank_gpu+=("$gpu_index")
+        rank_wqs+=("")
+    done
 
-        selected_dsa=""
-        selected_wq=""
-        for dsa_path in "${dsa_paths[@]}"; do
-            dsa_name=${dsa_path##*/}
-            [[ " ${used_dsa[*]} " == *" $dsa_name "* ]] && continue
-            dsa_numa=$(<"$dsa_path/numa_node")
-            [[ "$dsa_numa" == "$gpu_numa" ]] || continue
+    # Pass 0 gives every rank one DSA device; pass 1 adds a second one where the NUMA node has
+    # spare devices, so the DSA library can run H2D and D2H on separate devices (full duplex).
+    for pass in 0 1; do
+        for ((rank = 0; rank < tp_size; rank++)); do
+            gpu_numa=${rank_numa[$rank]}
+            selected_dsa=""
+            selected_wq=""
+            for dsa_path in "${dsa_paths[@]}"; do
+                dsa_name=${dsa_path##*/}
+                [[ " ${used_dsa[*]} " == *" $dsa_name "* ]] && continue
+                dsa_numa=$(<"$dsa_path/numa_node")
+                [[ "$dsa_numa" == "$gpu_numa" ]] || continue
 
-            dsa_id=${dsa_name#dsa}
-            mapfile -t candidate_wqs < <(
-                for wq_path in /sys/bus/dsa/devices/wq"$dsa_id".*; do
-                    [[ -e "$wq_path" ]] || continue
-                    [[ "$(<"$wq_path/type")" == "user" ]] || continue
-                    [[ "$(<"$wq_path/state")" == "enabled" ]] || continue
-                    basename "$wq_path"
-                done | sort -V
-            )
-            ((${#candidate_wqs[@]} > 0)) || continue
-            selected_dsa=$dsa_name
-            # Two WQs let the DSA library run H2D and D2H full duplex (one lane each).
-            selected_wq=$(IFS=,; echo "${candidate_wqs[*]:0:2}")
-            break
+                dsa_id=${dsa_name#dsa}
+                mapfile -t candidate_wqs < <(
+                    for wq_path in /sys/bus/dsa/devices/wq"$dsa_id".*; do
+                        [[ -e "$wq_path" ]] || continue
+                        [[ "$(<"$wq_path/type")" == "user" ]] || continue
+                        [[ "$(<"$wq_path/state")" == "enabled" ]] || continue
+                        basename "$wq_path"
+                    done | sort -V
+                )
+                ((${#candidate_wqs[@]} > 0)) || continue
+                selected_dsa=$dsa_name
+                selected_wq=${candidate_wqs[0]}
+                break
+            done
+
+            if [[ -z "$selected_dsa" ]]; then
+                ((pass > 0)) && continue
+                echo "ERROR: no unused DSA with enabled user WQs is available on NUMA $gpu_numa for GPU ${rank_gpu[$rank]}" >&2
+                return 1
+            fi
+            used_dsa+=("$selected_dsa")
+            rank_wqs[$rank]="${rank_wqs[$rank]:+${rank_wqs[$rank]},}$selected_wq"
+            echo "KVShrink GPU rank $rank: DSA=$selected_dsa WQ=$selected_wq" >&2
         done
-
-        if [[ -z "$selected_dsa" ]]; then
-            echo "ERROR: no unused DSA with enabled user WQs is available on NUMA $gpu_numa for GPU $gpu_index" >&2
-            return 1
-        fi
-        used_dsa+=("$selected_dsa")
-        rank_wqs+=("$selected_wq")
-        echo "KVShrink GPU rank $rank: DSA=$selected_dsa WQ=$selected_wq" >&2
     done
 
     result=$(IFS='|'; echo "${rank_wqs[*]}")

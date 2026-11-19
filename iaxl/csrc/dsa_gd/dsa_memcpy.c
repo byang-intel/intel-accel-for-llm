@@ -193,6 +193,52 @@ static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
                             struct dsa_completion_record *bcomp, void *const dest[],
                             const void *const src[], const size_t n[], size_t first, size_t cnt);
 
+/* "wqN.M" -> N; -1 if the name does not parse. */
+static long dsa_wq_device(const char *name) {
+    long id;
+
+    return sscanf(name, "wq%ld.", &id) == 1 ? id : -1;
+}
+
+/*
+ * Lanes are split by DSA device, not by WQ: an engine that mixes MMIO writes (H2D) and MMIO
+ * reads (D2H) serialises them, so several WQs on one device gain nothing. Devices go to the
+ * lanes round-robin in order of first appearance; with a single device the WQs are split
+ * between the lanes (and a lone WQ is shared). Returns the number of distinct devices.
+ */
+static size_t dsa_assign_lanes(size_t num_wq) {
+    long devices[DSA_MAX_WQ];
+    size_t ndev = 0, w, lane;
+
+    for (lane = 0; lane < DSA_LANES; lane++)
+        g_lane_num_wq[lane] = 0;
+
+    for (w = 0; w < num_wq; w++) {
+        long dev = dsa_wq_device(g_wq_name[w]);
+        size_t d;
+
+        for (d = 0; d < ndev && devices[d] != dev; d++)
+            ;
+        if (d == ndev)
+            devices[ndev++] = dev;
+        lane = d % DSA_LANES;
+        g_lane_wq[lane][g_lane_num_wq[lane]++] = w;
+    }
+
+    if (ndev < DSA_LANES) {
+        /* Too few devices for duplex: split the WQs between the lanes so they at least do not
+         * contend for descriptor slots; with a single WQ both lanes share it. */
+        size_t step = num_wq < DSA_LANES ? 1 : DSA_LANES;
+
+        for (lane = 0; lane < DSA_LANES; lane++) {
+            g_lane_num_wq[lane] = 0;
+            for (w = num_wq < DSA_LANES ? 0 : lane; w < num_wq; w += step)
+                g_lane_wq[lane][g_lane_num_wq[lane]++] = w;
+        }
+    }
+    return ndev;
+}
+
 static int dsa_submit(struct dsa_hw_desc *desc, void *portal) {
 #ifdef DSA_WQ_SHARED
     unsigned int retries = 0;
@@ -231,7 +277,7 @@ static int dsa_init(void) {
     struct dsa_hw_desc *subs[DSA_MAX_WQ] = {NULL};
     struct dsa_completion_record *comps[DSA_MAX_WQ] = {NULL};
     struct dsa_completion_record *bcomps[DSA_MAX_WQ] = {NULL};
-    size_t num_wq, w;
+    size_t num_wq, ndev, w;
     int ret = -1;
 
     pthread_mutex_lock(&g_init_mutex);
@@ -292,21 +338,15 @@ static int dsa_init(void) {
     }
     for (w = 0; w < DSA_BATCH_DEPTH; w++)
         g_all_slots[w] = w;
-    for (w = 0; w < DSA_LANES; w++) {
-        size_t k, step = num_wq < DSA_LANES ? 1 : DSA_LANES;
-
-        g_lane_num_wq[w] = 0;
-        for (k = num_wq < DSA_LANES ? 0 : w; k < num_wq; k += step)
-            g_lane_wq[w][g_lane_num_wq[w]++] = k;
-    }
+    ndev = dsa_assign_lanes(num_wq);
     g_num_wq = num_wq;
 
     fprintf(stderr,
-            "dsa_init: mapped %zu WQ(s) from $" DSA_WQS_ENV " (first %s), "
+            "dsa_init: mapped %zu WQ(s) on %zu device(s) from $" DSA_WQS_ENV " (first %s), "
             "max_transfer_size=%zu, max_batch_size=%zu, h2d lane %zu WQ(s), d2h lane %zu WQ(s)%s\n",
-            g_num_wq, g_wq_name[0], g_max_xfer, g_max_batch, g_lane_num_wq[DSA_LANE_H2D],
+            g_num_wq, ndev, g_wq_name[0], g_max_xfer, g_max_batch, g_lane_num_wq[DSA_LANE_H2D],
             g_lane_num_wq[DSA_LANE_D2H],
-            num_wq < DSA_LANES ? " (shared; list two WQs for full duplex)" : "");
+            ndev < DSA_LANES ? " (one device, no duplex; list WQs of two devices)" : "");
 
     ret = 0;
     goto out;

@@ -15,9 +15,11 @@ int dsa_memcpy(void *dest, const void *src, size_t n);
 int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count);
 
 /*
- * Lanes let H2D and D2H traffic run full duplex: each lane owns its own subset of the WQs
- * listed in $IAXL_DSA_WQS (lane L takes WQ L, L+2, ...; with a single WQ both lanes share it)
- * and its own ticket sequence, so waiting on one lane never waits for the other.
+ * Lanes let H2D and D2H traffic run full duplex. The WQs in $IAXL_DSA_WQS are grouped by DSA
+ * device and the devices are dealt to the lanes round-robin (1st device -> H2D, 2nd -> D2H,
+ * ...), so each lane owns whole devices. With a single device the WQs are split between the
+ * lanes instead (no duplex gain, the engine serialises MMIO reads behind writes).
+ * Each lane also has its own ticket sequence, so waiting on one lane never waits for the other.
  */
 #define DSA_LANE_H2D 0u
 #define DSA_LANE_D2H 1u

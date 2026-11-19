@@ -202,7 +202,8 @@ export IAXL_LD_PRELOAD=${IAXL_LD_PRELOAD:-/usr/lib/x86_64-linux-gnu/libtcmalloc_
 export TCMALLOC_RELEASE_RATE=${TCMALLOC_RELEASE_RATE:-0} # Keep freed memory in tcmalloc instead of returning it to the OS
 
 # ---- Intel DSA (host<->device copy accelerator, CUDA only) ------------------
-# List two or more WQs for full-duplex H2D/D2H: the 1st, 3rd, ... serve H2D, the 2nd, 4th, ... D2H.
+# List WQs of two DSA devices for full-duplex H2D/D2H (1st device -> H2D, 2nd -> D2H);
+# several WQs on one device do not help, the engine serialises MMIO reads behind writes.
 export IAXL_DSA_WQS=${IAXL_DSA_WQS:-wq0.0}                             # Comma/space separated DSA work-queue names
 
 # ---- Debug / profiling ------------------------------------------------------
