@@ -307,7 +307,8 @@ dsa_auto_detect() {
             )
             ((${#candidate_wqs[@]} > 0)) || continue
             selected_dsa=$dsa_name
-            selected_wq=${candidate_wqs[0]}
+            # Two WQs let the DSA library run H2D and D2H full duplex (one lane each).
+            selected_wq=$(IFS=,; echo "${candidate_wqs[*]:0:2}")
             break
         done
 

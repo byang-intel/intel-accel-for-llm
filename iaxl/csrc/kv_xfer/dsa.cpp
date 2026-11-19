@@ -15,19 +15,17 @@
 
 extern "C" {
 #include "dsa_gd.h"
+#include "dsa_memcpy.h"
 }
-
-extern "C" int64_t dsa_memcpy_batch_async(void *const dest[], const void *const src[],
-                                          const size_t n[], size_t count);
-extern "C" int dsa_memcpy_batch_wait(uint64_t ticket);
 
 namespace kv_xfer {
 
 using kv_pool::KVPool;
 using kv_pool::PoolDevice;
 
-// Serialises batch submission and mapping release; dsa_memcpy_batch_wait() needs no lock.
-static std::mutex dsa_context_mutex;
+// Serialises batch submission (per lane, so H2D and D2H submitters never block each other)
+// and mapping release; dsa_memcpy_batch_wait() needs no lock.
+static std::mutex dsa_submit_mutex[DSA_LANES];
 
 // One GDRCopy mapping per KV pool base: re-pinning on every copy overflowed libgdrapi's handles.
 struct DsaRegion {
@@ -67,8 +65,8 @@ static void dsa_on_unregister(const KVPool &p) {
     if (--it->second.refs > 0)
         return;
     // Wait for in-flight DSA batches before the mapping goes away.
-    std::lock_guard<std::mutex> submit_lock(dsa_context_mutex);
-    dsa_memcpy_batch_wait(UINT64_MAX);
+    std::scoped_lock submit_lock(dsa_submit_mutex[DSA_LANE_H2D], dsa_submit_mutex[DSA_LANE_D2H]);
+    dsa_memcpy_batch_wait(DSA_TICKET_ALL);
     IAXL_CHECK(dsa_gd_default_unregister(p.base, p.total_bytes) == 0,
                "dsa: KV pool mapping not found");
     dsa_regions.erase(it);
@@ -92,7 +90,8 @@ bool dsa_copy_chunks_batch(char *gpu_bar_base, int64_t chunk_stride, int64_t out
     if (gpu_bar_base == nullptr) // IAXL_DSA_GD_ENABLE=0: the KV pool has no BAR mapping
         return false;
 
-    std::lock_guard<std::mutex> lock(dsa_context_mutex);
+    const unsigned lane = is_h2d ? DSA_LANE_H2D : DSA_LANE_D2H;
+    std::lock_guard<std::mutex> lock(dsa_submit_mutex[lane]);
 
     if ((inner_size % 8) != 0)
         return false;
@@ -127,11 +126,11 @@ bool dsa_copy_chunks_batch(char *gpu_bar_base, int64_t chunk_stride, int64_t out
     }
 
     const int64_t t = dsa_memcpy_batch_async(
-        dest.data(), const_cast<const void *const *>(src.data()), nbytes.data(), count);
+        lane, dest.data(), const_cast<const void *const *>(src.data()), nbytes.data(), count);
     if (t < 0)
         return false;
-    // Tickets are monotonic, so remembering the latest one is enough to cover every batch
-    // this context has issued.
+    // Tickets are monotonic within a lane, so remembering the latest one is enough to cover
+    // every batch this context has issued.
     ticket = static_cast<uint64_t>(t);
     return true;
 }

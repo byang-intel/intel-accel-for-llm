@@ -19,6 +19,7 @@
 
 #include "env.h"
 #include "iaxl_common.h"
+#include "dsa_memcpy.h"
 
 #if !defined(DSA_WAIT_BUSYPOLL) && !defined(DSA_WAIT_UMWAIT) && !defined(DSA_WAIT_YIELD) &&        \
     !defined(DSA_WAIT_TPAUSE)
@@ -48,30 +49,6 @@
  */
 #define DSA_BATCH_DEPTH 2
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-int dsa_memcpy(void *dest, const void *src, size_t n);
-int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count);
-/*
- * Async variant: returns once every batch is submitted, leaving up to DSA_BATCH_DEPTH batches
- * per WQ in flight so back-to-back calls keep the engine busy. Returns a ticket (> 0) for this
- * call, 0 if count == 0, or -1 on error.
- *
- * dsa_memcpy_batch_wait(ticket) blocks until that call and every earlier async call has
- * completed (DSA_TICKET_ALL drains everything) and returns -1 if any of them failed. The two
- * functions are safe to call from different threads: a waiter never blocks a submitter and
- * only waits for the tickets it asked for. dsa_memcpy_batch() must not run while async batches
- * are in flight.
- */
-int64_t dsa_memcpy_batch_async(void *const dest[], const void *const src[], const size_t n[],
-                               size_t count);
-int dsa_memcpy_batch_wait(uint64_t ticket);
-#define DSA_TICKET_ALL UINT64_MAX
-#ifdef __cplusplus
-}
-#endif
-
 static char g_wq_name[DSA_MAX_WQ][32];
 static void *g_wq_portal[DSA_MAX_WQ];
 static size_t g_num_wq;
@@ -91,13 +68,20 @@ static struct dsa_completion_record *g_bcomps[DSA_MAX_WQ];
  * ticket says which dsa_memcpy_batch_async() call it belongs to, so a waiter can tell its own
  * batches from later ones. The mutex is only held for bookkeeping, never while polling the
  * hardware, so a submitter stuck for a free slot cannot stall a waiter and vice versa.
+ *
+ * Tickets are (sequence << 1) | lane: the low bit names the lane, the rest is that lane's own
+ * monotonic sequence, so "every earlier call" is evaluated per lane.
  */
 static pthread_mutex_t g_async_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_ticket[DSA_MAX_WQ][DSA_BATCH_DEPTH];
-static uint64_t g_last_ticket;   /* ticket handed out by the latest async call */
-static uint64_t g_first_failed;  /* lowest ticket whose batch failed, 0 = none */
-static size_t g_next_wq;         /* rotates so consecutive calls spread over the WQs */
+static uint64_t g_last_seq[DSA_LANES];      /* sequence handed out by the latest call per lane */
+static uint64_t g_first_failed[DSA_LANES];  /* lowest failed ticket per lane, 0 = none */
+static size_t g_lane_wq[DSA_LANES][DSA_MAX_WQ]; /* WQ indices each lane submits to */
+static size_t g_lane_num_wq[DSA_LANES];
+static size_t g_lane_next[DSA_LANES];       /* rotates so consecutive calls spread over the WQs */
 static size_t g_all_slots[DSA_BATCH_DEPTH];
+
+static inline unsigned dsa_ticket_lane(uint64_t ticket) { return (unsigned)(ticket & 1); }
 
 static inline void dsa_wait_pause(const volatile uint8_t *comp) {
 #if defined(DSA_WAIT_YIELD)
@@ -308,12 +292,21 @@ static int dsa_init(void) {
     }
     for (w = 0; w < DSA_BATCH_DEPTH; w++)
         g_all_slots[w] = w;
+    for (w = 0; w < DSA_LANES; w++) {
+        size_t k, step = num_wq < DSA_LANES ? 1 : DSA_LANES;
+
+        g_lane_num_wq[w] = 0;
+        for (k = num_wq < DSA_LANES ? 0 : w; k < num_wq; k += step)
+            g_lane_wq[w][g_lane_num_wq[w]++] = k;
+    }
     g_num_wq = num_wq;
 
     fprintf(stderr,
             "dsa_init: mapped %zu WQ(s) from $" DSA_WQS_ENV " (first %s), "
-            "max_transfer_size=%zu, max_batch_size=%zu\n",
-            g_num_wq, g_wq_name[0], g_max_xfer, g_max_batch);
+            "max_transfer_size=%zu, max_batch_size=%zu, h2d lane %zu WQ(s), d2h lane %zu WQ(s)%s\n",
+            g_num_wq, g_wq_name[0], g_max_xfer, g_max_batch, g_lane_num_wq[DSA_LANE_H2D],
+            g_lane_num_wq[DSA_LANE_D2H],
+            num_wq < DSA_LANES ? " (shared; list two WQs for full duplex)" : "");
 
     ret = 0;
     goto out;
@@ -560,27 +553,34 @@ static void dsa_reap_done(size_t w) {
         if (!ticket || !status)
             continue;
         if (status != DSA_COMP_SUCCESS) {
+            unsigned lane = dsa_ticket_lane(ticket);
+
             fprintf(stderr, "dsa batch failed, ticket=%" PRIu64 " status=0x%x\n", ticket, status);
             dsa_dump_batch_fail(g_comps[w] + slot * g_max_batch, g_max_batch);
-            if (!g_first_failed || ticket < g_first_failed)
-                g_first_failed = ticket;
+            if (!g_first_failed[lane] || ticket < g_first_failed[lane])
+                g_first_failed[lane] = ticket;
         }
         g_ticket[w][slot] = 0;
     }
 }
 
 /*
- * Reaps finished batches on every WQ and returns the completion status of one batch that is
- * still in flight with a ticket <= `ticket`, or NULL once none is left. Called with
- * g_async_mutex held; the caller polls the returned status after releasing the lock.
+ * Reaps finished batches on the ticket's lane and returns the completion status of one batch
+ * that is still in flight on that lane with a ticket <= `ticket`, or NULL once none is left.
+ * Called with g_async_mutex held; the caller polls the returned status after releasing the lock.
  */
 static volatile uint8_t *dsa_find_pending(uint64_t ticket) {
-    size_t w, slot;
+    unsigned lane = dsa_ticket_lane(ticket);
+    size_t i, slot;
 
-    for (w = 0; w < g_num_wq; w++) {
+    for (i = 0; i < g_lane_num_wq[lane]; i++) {
+        size_t w = g_lane_wq[lane][i];
+
         dsa_reap_done(w);
         for (slot = 0; slot < DSA_BATCH_DEPTH; slot++) {
-            if (g_ticket[w][slot] && g_ticket[w][slot] <= ticket)
+            uint64_t t = g_ticket[w][slot];
+
+            if (t && dsa_ticket_lane(t) == lane && t <= ticket)
                 return &g_bcomps[w][slot].status;
         }
     }
@@ -637,40 +637,44 @@ static int dsa_check_entries(const char *who, void *const dest[], const void *co
     return 0;
 }
 
-int64_t dsa_memcpy_batch_async(void *const dest[], const void *const src[], const size_t n[],
-                               size_t count) {
-    size_t per_batch, done;
+int64_t dsa_memcpy_batch_async(unsigned lane, void *const dest[], const void *const src[],
+                               const size_t n[], size_t count) {
+    size_t per_batch, done, lane_wqs;
     uint64_t ticket;
 
     if (count == 0)
         return 0;
+    if (lane >= DSA_LANES) {
+        fprintf(stderr, "dsa_memcpy_batch_async: invalid lane %u\n", lane);
+        return -1;
+    }
 
     if (dsa_init() || dsa_check_entries("dsa_memcpy_batch_async", dest, src, n, count))
         return -1;
 
     pthread_mutex_lock(&g_async_mutex);
-    ticket = ++g_last_ticket;
+    ticket = (++g_last_seq[lane] << 1) | lane;
     pthread_mutex_unlock(&g_async_mutex);
 
-    /* Spread even a small call over every WQ; submission is cheap enough for one thread. */
-    per_batch = (count + g_num_wq - 1) / g_num_wq;
+    /* Spread even a small call over the lane's WQs; submission is cheap enough for one thread. */
+    lane_wqs = g_lane_num_wq[lane];
+    per_batch = (count + lane_wqs - 1) / lane_wqs;
     if (per_batch > g_max_batch)
         per_batch = g_max_batch;
 
     for (done = 0; done < count; done += per_batch) {
-        size_t w = __atomic_fetch_add(&g_next_wq, 1, __ATOMIC_RELAXED) % g_num_wq;
+        size_t i = __atomic_fetch_add(&g_lane_next[lane], 1, __ATOMIC_RELAXED) % lane_wqs;
         size_t cnt = count - done < per_batch ? count - done : per_batch;
 
-        if (dsa_submit_slot(w, ticket, dest, src, n, done, cnt))
+        if (dsa_submit_slot(g_lane_wq[lane][i], ticket, dest, src, n, done, cnt))
             return -1;
     }
 
     return (int64_t)ticket;
 }
 
-int dsa_memcpy_batch_wait(uint64_t ticket) {
-    if (!g_num_wq)
-        return 0; /* nothing was ever submitted */
+static int dsa_wait_lane(uint64_t ticket) {
+    unsigned lane = dsa_ticket_lane(ticket);
 
     for (;;) {
         volatile uint8_t *status;
@@ -678,7 +682,7 @@ int dsa_memcpy_batch_wait(uint64_t ticket) {
 
         pthread_mutex_lock(&g_async_mutex);
         status = dsa_find_pending(ticket);
-        failed = g_first_failed && g_first_failed <= ticket;
+        failed = g_first_failed[lane] && g_first_failed[lane] <= ticket;
         pthread_mutex_unlock(&g_async_mutex);
 
         if (!status)
@@ -692,6 +696,22 @@ int dsa_memcpy_batch_wait(uint64_t ticket) {
          */
         dsa_wait_completion(status);
     }
+}
+
+int dsa_memcpy_batch_wait(uint64_t ticket) {
+    if (!g_num_wq)
+        return 0; /* nothing was ever submitted */
+
+    if (ticket == DSA_TICKET_ALL) {
+        int rc = 0;
+        unsigned lane;
+
+        /* UINT64_MAX has lane bit 1; drain lane 0 with its own all-ones ticket. */
+        for (lane = 0; lane < DSA_LANES; lane++)
+            rc |= dsa_wait_lane((UINT64_MAX << 1) | lane);
+        return rc;
+    }
+    return dsa_wait_lane(ticket);
 }
 
 #ifdef DSA_MEMCPY_TEST

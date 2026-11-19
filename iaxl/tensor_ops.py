@@ -66,12 +66,21 @@ class SliceCopier:
             self._gpu_name, self._cpu_name, direction, f"copy_slices_{backend}", self._work_stream
         )
 
-    def copy(self) -> None:
+    def start(self) -> None:
+        """Submit the copy; call wait() before reading the destination or calling start() again."""
         if not self._index:
             return
         self._context.xfer_chunks_batch(self._index, self._cpu_index)
         self._context.xfer_finish()
+
+    def wait(self) -> None:
+        if not self._index:
+            return
         self._context.xfer_wait()
+
+    def copy(self) -> None:
+        self.start()
+        self.wait()
 
     def close(self) -> None:
         if self._context is None:

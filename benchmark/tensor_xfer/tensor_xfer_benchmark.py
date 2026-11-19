@@ -10,7 +10,9 @@ Example:
 """
 
 import argparse
+import contextlib
 import os
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -33,8 +35,8 @@ from iaxl.utils.flamegraph import PerfRecorder
 
 DEFAULT_FRAG_SIZES = "1K,4K,8K,16K,32K,64K,128K,256K,512K,1M,2M"
 DEFAULT_OUTPUT_DIR = "/_data/tensor_xfer_benchmark"
-# BIDIR issues H2D and D2H at the same time on two streams (PCIe full duplex) and
-# reports each direction separately as "BIDIR H2D" / "BIDIR D2H".
+# BIDIR issues H2D and D2H at the same time, one thread per direction (PCIe full duplex),
+# and reports each direction separately as "BIDIR H2D" / "BIDIR D2H".
 DIRECTIONS = {
     "h2d": ("H2D",),
     "d2h": ("D2H",),
@@ -42,7 +44,7 @@ DIRECTIONS = {
     "bidir": ("BIDIR",),
     "all": ("H2D", "D2H", "BIDIR"),
 }
-BIDIR_METHODS = ("cuda", "batch")
+BIDIR_METHODS = ("cuda", "batch", "iaxl")
 # Passes queued ahead per stream; keeps both directions busy without a long drain tail.
 BIDIR_LOOKAHEAD = 2
 PLOT_DIRECTIONS = ("H2D", "D2H", "BIDIR H2D", "BIDIR D2H")
@@ -390,57 +392,89 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
     return results
 
 
+@dataclass
+class BidirPass:
+    """One direction of a bidir run: issue() enqueues a pass, wait() blocks on its handle."""
+
+    issue: Callable[[], Any]
+    wait: Callable[[Any], None]
+    lookahead: int = BIDIR_LOOKAHEAD
+    stream: torch.cuda.Stream | None = None  # made current on the direction's thread
+
+
+def stream_pass(run: Callable[[], None], stream: torch.cuda.Stream) -> BidirPass:
+    def issue() -> torch.cuda.Event:
+        run()
+        event = torch.cuda.Event()
+        event.record(stream)
+        return event
+
+    return BidirPass(issue, lambda event: event.synchronize(), stream=stream)
+
+
 def measure_bidir(
-    passes: tuple[Callable[[], None], Callable[[], None]],
-    streams: tuple[torch.cuda.Stream, torch.cuda.Stream],
+    passes: tuple[BidirPass, BidirPass],
     *,
     seconds: float,
     warmup: int,
     label: tuple[str, ...] = (),
 ) -> list[tuple[float, int]]:
-    """Run both passes concurrently for `seconds`, each stream at its own pace.
+    """Run both passes concurrently for `seconds`, each direction on its own thread.
 
-    Returns (milliseconds, passes completed) per stream, timed with events on that
-    stream, so each direction's bandwidth is measured while the other is active.
+    Returns (milliseconds, passes completed) per direction, so each direction's
+    bandwidth is measured while the other is active.
     """
-    for _ in range(warmup):
-        for stream, run_pass in zip(streams, passes):
-            with torch.cuda.stream(stream):
-                run_pass()
-    torch.cuda.synchronize()
+    barrier = threading.Barrier(len(passes) + 1)
+    timings: list[tuple[float, int]] = [(0.0, 0)] * len(passes)
+    errors: list[BaseException] = []
 
+    def worker(index: int, bidir_pass: BidirPass) -> None:
+        pending: deque[Any] = deque()
+        count = 0
+        try:
+            with (
+                torch.cuda.stream(bidir_pass.stream)
+                if bidir_pass.stream is not None
+                else contextlib.nullcontext()
+            ):
+                for _ in range(warmup):
+                    bidir_pass.wait(bidir_pass.issue())
+                barrier.wait()
+                start = time.perf_counter()
+                deadline = start + seconds
+                while time.perf_counter() < deadline:
+                    if len(pending) >= bidir_pass.lookahead:
+                        bidir_pass.wait(pending.popleft())
+                    pending.append(bidir_pass.issue())
+                    count += 1
+                while pending:
+                    bidir_pass.wait(pending.popleft())
+                timings[index] = ((time.perf_counter() - start) * 1000, count)
+        except BaseException as error:  # noqa: BLE001 - re-raised on the main thread
+            errors.append(error)
+            barrier.abort()
+
+    threads = [
+        threading.Thread(target=worker, args=(index, bidir_pass), daemon=True)
+        for index, bidir_pass in enumerate(passes)
+    ]
+    for thread in threads:
+        thread.start()
     if RECORDER is not None:
         RECORDER.start(label)
     if SYNC is not None:
         SYNC()
-    starts = [torch.cuda.Event(enable_timing=True) for _ in streams]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in streams]
-    pending: list[deque[torch.cuda.Event]] = [deque() for _ in streams]
-    rounds = [0 for _ in streams]
-    for stream, start in zip(streams, starts):
-        start.record(stream)
-    deadline = time.perf_counter() + seconds
-    while time.perf_counter() < deadline:
-        for index, (stream, run_pass) in enumerate(zip(streams, passes)):
-            queue = pending[index]
-            while queue and queue[0].query():
-                queue.popleft()
-            if len(queue) >= BIDIR_LOOKAHEAD:
-                continue
-            with torch.cuda.stream(stream):
-                run_pass()
-                done = torch.cuda.Event()
-                done.record(stream)
-                queue.append(done)
-            rounds[index] += 1
-    for stream, end in zip(streams, ends):
-        end.record(stream)
-    torch.cuda.synchronize()
+    try:
+        barrier.wait()
+    except threading.BrokenBarrierError:
+        pass
+    for thread in threads:
+        thread.join()
     if RECORDER is not None:
         RECORDER.stop()
-    return [
-        (start.elapsed_time(end), count) for start, end, count in zip(starts, ends, rounds)
-    ]
+    if errors:
+        raise errors[0]
+    return timings
 
 
 def run_bidir(
@@ -452,6 +486,7 @@ def run_bidir(
     args: argparse.Namespace,
 ) -> list[Result]:
     frag_elements = frag_bytes // 2
+    fragments = len(src_indices)
     pass_bytes = source.nbytes
     label = ("BIDIR", format_size(frag_bytes))
     host_src = source.clone().pin_memory()
@@ -482,10 +517,15 @@ def run_bidir(
         clear_destinations()
         timings = measure_bidir(
             (
-                lambda: slice_copy(host_src, gpu_dst, src_indices, dst_indices, frag_elements),
-                lambda: slice_copy(gpu_src, host_dst, src_indices, dst_indices, frag_elements),
+                stream_pass(
+                    lambda: slice_copy(host_src, gpu_dst, src_indices, dst_indices, frag_elements),
+                    streams[0],
+                ),
+                stream_pass(
+                    lambda: slice_copy(gpu_src, host_dst, src_indices, dst_indices, frag_elements),
+                    streams[1],
+                ),
             ),
-            streams,
             seconds=args.bidir_seconds,
             warmup=args.warmup,
             label=label + ("CUDA Copy",),
@@ -504,13 +544,40 @@ def run_bidir(
 
         clear_destinations()
         timings = measure_bidir(
-            (lambda: batch_copy(h2d_operations), lambda: batch_copy(d2h_operations)),
-            streams,
+            (
+                stream_pass(lambda: batch_copy(h2d_operations), streams[0]),
+                stream_pass(lambda: batch_copy(d2h_operations), streams[1]),
+            ),
             seconds=args.bidir_seconds,
             warmup=args.warmup,
             label=label + ("cudaMemcpy3DBatchAsync",),
         )
         results.extend(record("CUDA Copy Batch", timings))
+
+    if "iaxl" in args.methods:
+        h2d_copier = SliceCopier(
+            host_src.view(fragments, frag_elements), 0, dst_indices,
+            out=gpu_dst.view(fragments, frag_elements),
+        )
+        d2h_copier = SliceCopier(
+            gpu_src.view(fragments, frag_elements), 0, src_indices,
+            out=host_dst.view(fragments, frag_elements), cpu_index=dst_indices,
+        )
+
+        # A SliceCopier tracks one transfer at a time, so no lookahead.
+        def dsa_pass(copier: SliceCopier) -> BidirPass:
+            return BidirPass(copier.start, lambda _: copier.wait(), lookahead=1)
+
+        clear_destinations()
+        timings = measure_bidir(
+            (dsa_pass(h2d_copier), dsa_pass(d2h_copier)),
+            seconds=args.bidir_seconds,
+            warmup=args.warmup,
+            label=label + ("IAXL DSA",),
+        )
+        h2d_copier.close()
+        d2h_copier.close()
+        results.extend(record("IAXL DSA", timings))
 
     return results
 
